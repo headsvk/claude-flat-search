@@ -1,0 +1,109 @@
+# flat-search configuration.
+#
+# Copy this to criteria.toml in the repo root and edit it. criteria.toml is
+# gitignored, so your budget, areas and dates stay local.
+#
+# Unknown keys are an ERROR, not a silent default - a threshold that quietly
+# reverts filters the wrong listings for weeks with nothing looking wrong.
+#
+# The measured portal behaviour behind these choices - which filters actually
+# work, which are accepted and ignored - is in docs/portals.md. Read it before
+# changing a search URL.
+
+
+[requirements]
+# These reject a listing outright. An UNKNOWN value never rejects: only a
+# stated value that violates the rule does.
+min_bedrooms  = 2
+min_bathrooms = 2
+max_bedrooms  = 0        # 0 = no upper limit
+budget_pcm    = 3000     # per calendar month
+
+# Keep budget_pcm in step with the [searches] URLs below. A URL looser than
+# this is merely wasteful - the extra listings are fetched then rejected. A URL
+# TIGHTER never fetches them at all, so raising budget_pcm without editing the
+# URLs silently deletes the band you just opened up. The run warns about this.
+
+
+[preferences]
+# Preferences rank a listing. They never exclude one.
+furnishing = "unfurnished"   # furnished | unfurnished | either
+
+# min_sqft rejects only a STATED size below the threshold. Most listings state
+# none (see docs/portals.md for per-portal coverage), so requiring one would
+# delete most of the market; an unstated size is flagged instead. A size read
+# off a floorplan by OCR never rejects either.
+min_sqft = 800
+
+# At or above good_floor_from, gain a tier. Ground floor drops one; lower
+# ground, basement and garden level are an outright no.
+good_floor_from = 2
+
+# At or above this floor, no confirmed lift drops a tier and flags - never
+# excludes, because listings state the presence of a lift but never its absence.
+lift_required_from_floor = 3
+
+# preferred | required | ignored. In-unit A/C promotes one tier. Telling
+# in-unit from the residents' gym is the one judgement needing a model.
+aircon = "preferred"
+
+
+[districts]
+# Postcode districts, because "affluent" or "central" has no field on any
+# portal and neighbourhood names are written inconsistently.
+#
+# only = true rejects anything outside the three lists. An UNKNOWN district is
+# never rejected - it ranks fringe and is flagged, because addresses from outer
+# searches often carry no postcode at all ("Richmond, Surrey").
+only = true
+
+# Illustrative central-London values. Replace them.
+prime    = ["W1", "SW1", "SW3", "SW7"]
+affluent = ["W2", "W4", "W9", "SW6", "SW11", "N1", "WC1", "WC2"]
+fringe   = ["W6", "W10", "SW4", "SE1", "E14"]
+
+
+[dates]
+# Leave move_in empty and availability never affects priority.
+move_in = ""                 # e.g. "2026-12-01"
+move_in_slack_days = 7
+
+
+[run]
+# How many detail pages one run fetches. Anything beyond waits for the next
+# run and is held OUT of the daily file until its details exist, so it is
+# never reported as a stub.
+stage2_cap = 150
+
+# Everything a run writes - state, cache, daily files, logs - lives here.
+# Relative paths resolve against this file. Keeps the repo source-only.
+data_dir = "data"
+
+
+[searches]
+# One list per portal. Build each URL on the portal itself with the filters you
+# want, then paste it here.
+#
+# VERIFY EVERY PARAMETER BY TESTING IT, never by reading the filter UI - several
+# are accepted and silently ignored. See docs/portals.md.
+#
+# A URL is a search only because it is in this table. URLs written in comments
+# or documentation are never fetched.
+
+rightmove = [
+  "https://www.rightmove.co.uk/property-to-rent/find.html?searchType=RENT&locationIdentifier=REGION%5E87490&minBedrooms=2&minBathrooms=2&maxPrice=3000&includeLetAgreed=false&sortType=6",
+]
+
+zoopla = [
+  "https://www.zoopla.co.uk/to-rent/property/london/?baths_min=2&beds_min=2&price_frequency=per_month&price_max=3000&q=London&search_source=to-rent&results_sort=newest_listings",
+]
+
+# No bathroom parameter on purpose: OnTheMarket accepts one and ignores it, so
+# its bathroom filtering happens locally.
+onthemarket = [
+  "https://www.onthemarket.com/to-rent/property/london/?max-price=3000&min-bedrooms=2&sort-field=update_date",
+]
+
+openrent = [
+  "https://www.openrent.co.uk/properties-to-rent/london?term=London&prices_max=3000&bedrooms_min=2&bathrooms_min=2",
+]

@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+"""Fetch layer - local headless Chromium via Playwright, all four portals.
+
+One browser per portal run, cookie consent accepted before reading anything,
+jittered pacing, and a hard cache so a listing page is never fetched twice.
+
+    fetch.py search  --out RUN/stage1.json
+    fetch.py details --queue RUN/queue.json --stage1 RUN/stage1.json
+
+Two hard-won rules are encoded here:
+
+* **Accept cookie consent first.** Zoopla renders zero cards behind its consent
+  wall and then escalates to a Cloudflare challenge on repeat visits. Consent
+  handled, the same URL returns a full page and the bathroom filter grades
+  correctly. This was the root cause of three wrong conclusions.
+
+* **Never reuse a page across search URLs.** Navigating several searches through
+  one page object returns a full first page and empty ones after - an ordering
+  artifact that looks exactly like a broken filter. Each search URL gets a fresh
+  context.
+
+A challenge page and a genuinely empty result set look identical, so an empty
+search is reported as an ERROR, never as a quiet success.
+
+Setup:  pip install playwright && python -m playwright install chromium
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import pathlib
+import random
+import re
+import shutil
+import sys
+
+from . import core
+from . import floorplan
+from . import portals
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+
+MAX_PAGES = 8
+
+CONSENT = ["#onetrust-accept-btn-handler",
+           "button:has-text('Accept all')", "button:has-text('Accept All')",
+           "button:has-text('Accept cookies')", "button:has-text('Agree')",
+           "button:has-text('Accept')"]
+
+# Region-scoped searches place a listing whose address omits the postcode.
+REGION_DISTRICT = {
+    "REGION%5E1127": ("TW9", "Richmond"),
+    "REGION%5E1368": ("TW1", "Twickenham"),
+    "REGION%5E746": ("KT2", "Kingston upon Thames"),
+    "REGION%5E317": ("IG7", "Chigwell"),
+    "OUTCODE%5E855": ("EN5", "High Barnet"),
+}
+
+
+class Session:
+    """A browser whose cookie consent has been dealt with."""
+
+    def __init__(self, min_gap=2.0, max_gap=5.0):
+        self.min_gap, self.max_gap = min_gap, max_gap
+        self._consented = False
+        self._first = True
+
+    async def __aenter__(self):
+        from playwright.async_api import async_playwright
+        self._pw = await async_playwright().start()
+        self._b = await self._pw.chromium.launch(headless=True)
+        self._ctx = await self._b.new_context(user_agent=UA, locale="en-GB")
+        self.page = await self._ctx.new_page()
+        return self
+
+    async def __aexit__(self, *exc):
+        await self._b.close()
+        await self._pw.stop()
+
+    async def _consent(self):
+        for sel in CONSENT:
+            try:
+                el = await self.page.query_selector(sel)
+                if el and await el.is_visible():
+                    await el.click()
+                    await self.page.wait_for_timeout(2500)
+                    self._consented = True
+                    return sel
+            except Exception:
+                pass
+        return None
+
+    async def get(self, url: str, settle=4000) -> str:
+        if self._first:
+            self._first = False
+        else:
+            await asyncio.sleep(random.uniform(self.min_gap, self.max_gap))
+        await self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
+        await self.page.wait_for_timeout(2500)
+        if not self._consented:
+            await self._consent()
+        await self.page.wait_for_timeout(settle)
+        html = await self.page.content()
+        try:
+            body = await self.page.inner_text("body")
+        except Exception:
+            body = ""
+        if portals.CHALLENGE.search(body[:4000]):
+            raise RuntimeError("CHALLENGED by %s" % url.split("/")[2])
+        self.text = body
+        return html
+
+    async def expand(self):
+        """Descriptions are collapsed behind a control on most portals; a
+        truncated read is indistinguishable from a listing that says nothing.
+
+        Two guards, both learned the hard way:
+        * the control's WHOLE label must match - a loose "See more" matched
+          OnTheMarket's "See more properties like this" and navigated to a
+          search page, which then extracted as an empty listing;
+        * if the URL changes anyway, keep the pre-expand text.
+        """
+        before_url = self.page.url
+        before_text = getattr(self, "text", "") or ""
+        labels = ("Read full description", "Show full description",
+                  "Read more", "Show more", "More details")
+        for label in labels:
+            try:
+                for tag in ("button", "a"):
+                    el = await self.page.query_selector("%s:text-is('%s')" % (tag, label))
+                    if el and await el.is_visible():
+                        await el.click()
+                        await self.page.wait_for_timeout(1200)
+                        break
+            except Exception:
+                pass
+        for _ in range(3):
+            try:
+                await self.page.mouse.wheel(0, 6000)
+                await self.page.wait_for_timeout(700)
+            except Exception:
+                break
+        try:
+            after = await self.page.inner_text("body")
+        except Exception:
+            return before_text
+        if self.page.url != before_url:
+            # a click navigated away - that text belongs to another page
+            try:
+                await self.page.goto(before_url, timeout=45000,
+                                     wait_until="domcontentloaded")
+                await self.page.wait_for_timeout(2500)
+                after = await self.page.inner_text("body")
+            except Exception:
+                after = before_text
+        self.text = after if len(after) >= len(before_text) * 0.6 else before_text
+        return self.text
+
+
+async def collect(url: str, seen: set, known: set | None = None,
+                  incremental: bool = False) -> tuple[list, str]:
+    """One search URL, its own browser. Returns (new listings, status)."""
+    pt = portals.portal_for(url)
+    if not pt:
+        return [], "no portal handler"
+    ident = re.search(r"locationIdentifier=([A-Z]+%5E\d+)", url)
+    fallback = REGION_DISTRICT.get(ident.group(1)) if ident else None
+
+    found, local_seen, stale = [], set(), 0
+    for page_no in range(MAX_PAGES):
+        target = url if page_no == 0 else url + (pt["page_param"] % (page_no * pt["step"]
+                                                                     if pt["step"] > 1
+                                                                     else page_no + 1))
+        # A FRESH browser per page. Reusing one page object across paginated
+        # URLs returns a full first page and empty ones after - measured, and
+        # it is indistinguishable from "the portal has no more results".
+        # Zoopla looked capped at 28 listings for exactly this reason; with a
+        # fresh context, pn=2 and pn=3 overlap page 1 by 0%.
+        async with Session() as s:
+            html = await s.get(target)
+            res = pt["search"](html, s.page)
+            rows, total = (await res) if asyncio.iscoroutine(res) else res
+        if not rows:
+            return found, ("EMPTY on page %d" % page_no) if page_no == 0 else "ok"
+
+        page_urls = {r["url"] for r in rows if r.get("url")}
+        # Pagination advance is judged PER SEARCH, not against the global dedup
+        # set. Searches overlap (all-London contains Richmond), so a page that is
+        # entirely new-to-the-portal but already collected by another search must
+        # not be read as "no more pages" - that silently truncated whole searches.
+        advancing = bool(page_urls - local_seen)
+        local_seen |= page_urls
+
+        fresh = [r for r in rows if r.get("url") and r["url"] not in seen]
+        for r in fresh:
+            seen.add(r["url"])
+            if fallback:
+                r["region_district"], r["region_name"] = fallback
+                r["area_trusted"] = True
+        found += fresh
+
+        if not advancing:                   # same page served again - truly done
+            break
+        if total and len(local_seen) >= total:
+            break
+        if pt["step"] > 1 and total and (page_no + 1) * pt["step"] >= total:
+            break
+
+        # Incremental runs stop once the portal is serving listings we already
+        # track. Only sound when the search is sorted newest-first, and only
+        # after TWO consecutive stale pages, so one unlucky page cannot end it.
+        if incremental and known and pt.get("sorted_newest"):
+            already = len(page_urls & known) / max(len(page_urls), 1)
+            stale = stale + 1 if already >= 0.9 else 0
+            if stale >= 2:
+                return found, "stopped early: 2 pages >=90%% already tracked"
+    return found, "ok"
+
+
+async def run_search(cfg, out_path, incremental: bool = False) -> bool:
+    """-> True when every portal came back clean.
+
+    Returns a bool rather than exiting, because the CALLER has to decide what a
+    failed search means - and the only safe answer is "do not commit". An empty
+    search and a blocked one are indistinguishable from here.
+    """
+    await preflight(cfg)
+    out_path = pathlib.Path(out_path)
+    urls = list(cfg.searches)
+    if not urls:
+        raise RuntimeError("no [searches] URLs in the config")
+    known = set()
+    if incremental:
+        known = core.known_urls(cfg)
+        print("incremental: %d listings already tracked" % len(known))
+
+    by_host: dict = {}
+    for url in urls:
+        by_host.setdefault(url.split("/")[2], []).append(url)
+
+    async def run_host(host, host_urls):
+        """One browser per portal, its URLs in order - unchanged behaviour."""
+        seen, rows_all, problems, log = set(), [], [], []
+        for url in host_urls:
+            try:
+                rows, status = await collect(url, seen, known, incremental)
+            except Exception as exc:
+                problems.append("%s  %s" % (host, str(exc)[:90]))
+                log.append("  !! %-22s %s" % (host, str(exc)[:90]))
+                continue
+            if status != "ok":
+                problems.append("%s  %s" % (host, status))
+            rows_all += rows
+            log.append("  %-22s +%-4d %s" % (host, len(rows), status))
+            await asyncio.sleep(random.uniform(3, 6))
+        print("  done %-20s %d listings" % (host, len(rows_all)), flush=True)
+        return rows_all, problems, log
+
+    print("searching %d portals concurrently" % len(by_host), flush=True)
+    results = await asyncio.gather(*(run_host(h, u) for h, u in by_host.items()))
+
+    listings, problems, merged = [], [], set()
+    for rows, host_problems, log in results:
+        problems += host_problems
+        print('\n'.join(log))
+        for row in rows:
+            url = row.get("url")
+            if url and url not in merged:
+                merged.add(url)
+                listings.append(row)
+
+    core.write_json(out_path, {"run_date": core.today(), "listings": listings})
+    by = {}
+    for l in listings:
+        by[l["platform"]] = by.get(l["platform"], 0) + 1
+    print("\n%d unique listings  %s" % (len(listings), by))
+    print("-> %s" % out_path)
+    if problems:
+        print("\nPROBLEMS (an empty search is indistinguishable from a block):")
+        for p in problems:
+            print("   ! %s" % p)
+        return False
+    return True
+
+
+
+# OpenRent names no floorplan: it is just another listing photo, and the URLs are
+# built client side, so they have to come from the rendered DOM.
+OPENRENT_IMAGES = """() => {
+  const out = new Set();
+  document.querySelectorAll('img').forEach(i => {
+    [i.src, i.dataset.src].forEach(v => { if (v) out.add(v); });
+    if (i.srcset) i.srcset.split(',').forEach(p => out.add(p.trim().split(' ')[0]));
+  });
+  return [...out];
+}"""
+
+
+async def floorplan_size(session, html, portal_name, cfg, url):
+    """Read the size off the floorplan, for listings that state none.
+
+    A FALLBACK ONLY: a stated size always wins. What comes back is recorded as
+    `size_sqft_plan`, never as `size_sqft`, so it cannot reach the hard filter -
+    a misread plan must not delete a flat, so this is flag-only by design.
+    """
+    if portal_name == "OpenRent":
+        try:
+            images = await session.page.evaluate(OPENRENT_IMAGES)
+        except Exception:
+            return None
+        candidates = [u for u in images
+                      if "imagescdn.openrent" in u and "staticMap" not in u]
+    else:
+        candidates = floorplan.plan_urls(html, portal_name)
+    if not candidates:
+        return None
+    workdir = cfg.runs_dir / "plans" / re.sub(r"[^A-Za-z0-9]+", "_", url)[-60:]
+    try:
+        result = floorplan.area_from_candidates(candidates, workdir)
+    except Exception as exc:
+        print("  plan-fail %-34s %s" % (url[-34:], str(exc)[:40]))
+        return None
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return result if result.get("sqft") else None
+
+
+async def run_details(cfg, queue_path, stage1_path, host=None):
+    await preflight(cfg)
+    queue = core.read_json(pathlib.Path(queue_path))
+    items = queue.get("fetch", [])
+    stage1_path = pathlib.Path(stage1_path)
+    stage1 = core.read_json(stage1_path)
+    by_url = {l["url"]: l for l in stage1.get("listings", [])}
+    done = failed = 0
+
+    groups: dict[str, list] = {}
+    for it in items:
+        if not pathlib.Path(it["cache_path"]).exists():
+            groups.setdefault(it["url"].split("/")[2], []).append(it)
+    if host:
+        groups = {h: g for h, g in groups.items() if host.lower() in h.lower()}
+        if not groups:
+            print("no queued listings match --host %s" % host)
+            print("queued hosts: " + ", ".join(sorted(
+                {it["url"].split("/")[2] for it in items})))
+            return
+    if not groups:
+        print("nothing to fetch - cache is warm")
+        return
+
+    async def run_host(host, group):
+        # These tally the whole run across all four workers.
+        nonlocal done, failed
+        pt = portals.portal_for(group[0]["url"])
+        host_done = host_failed = 0
+        retry: list = []
+        print('\n' + "--- %s: %d to fetch ---" % (host, len(group)))
+        async with Session() as s:
+            for it in group:
+                try:
+                    html = await s.get(it["url"], settle=3000)
+                    text = await s.expand()
+                    parts, info = pt["detail"](html, text)
+                    if pt["name"] == "Rightmove":
+                        flat = portals.untag(html)
+                        for label, key in (("Furnish type", "furnished"),
+                                           ("Let available date", "available_from")):
+                            m = re.search(re.escape(label) + r"\s*:?\s*([A-Za-z0-9 /,-]{2,30})", flat)
+                            if m:
+                                v = clean_value(m.group(1))
+                                if v:
+                                    parts.append("%s: %s" % (label, v))
+                                    info[key] = v
+                    row = by_url.get(it["url"]) or {}
+                    if not (info.get("size_sqft") or row.get("size_sqft")):
+                        plan = await floorplan_size(s, html, pt["name"], cfg, it["url"])
+                        if plan:
+                            info["size_sqft_plan"] = plan["sqft"]
+                            info["size_plan_basis"] = plan["basis"]
+                            info["size_plan_confident"] = plan["confident"]
+                            parts.append(
+                                "Floorplan area: %d sq ft (%s, %s) - read by OCR from %s"
+                                % (plan["sqft"], plan["basis"],
+                                   "clear" if plan["confident"] else "AMBIGUOUS - verify",
+                                   plan.get("image", "")))
+                            parts.append("Floorplan text: " + plan.get("evidence", ""))
+                    text = "\n".join(parts)
+                    if not text.strip():
+                        # One browser page is reused across navigations, and some
+                        # portals - Zoopla measurably - serve the first listing in
+                        # full and blanks afterwards. Retry once in a fresh
+                        # session before believing the listing is contentless.
+                        retry.append(it)
+                        continue
+                    core.write_json(pathlib.Path(it["cache_path"]),
+                                    {"url": it["url"], "fetched_at": core.today(),
+                                     "source": pt["name"].lower() + "-detail", "text": text})
+                    row = by_url.get(it["url"])
+                    if row:
+                        for k, v in info.items():
+                            if not row.get(k):
+                                row[k] = v
+                    done += 1
+                    host_done += 1
+                    print("  ok %-46s %5d chars" % (it["url"][-46:], len(text)))
+                except Exception as e:
+                    print("  FAIL %-42s %s" % (it["url"][-42:], str(e)[:60]))
+                    failed += 1
+                    host_failed += 1
+        for it in retry:
+            recovered = False
+            try:
+                async with Session() as s2:
+                    html = await s2.get(it["url"], settle=5000)
+                    text = await s2.expand()
+                    parts, info = pt["detail"](html, text)
+                    text = chr(10).join(parts)
+                    if text.strip():
+                        core.write_json(pathlib.Path(it["cache_path"]),
+                                        {"url": it["url"], "fetched_at": core.today(),
+                                         "source": pt["name"].lower() + "-detail",
+                                         "text": text})
+                        row = by_url.get(it["url"])
+                        if row:
+                            for k, v in info.items():
+                                if not row.get(k):
+                                    row[k] = v
+                        recovered = True
+            except Exception as e:
+                print("  FAIL(retry) %-36s %s" % (it["url"][-36:], str(e)[:50]))
+            if recovered:
+                done += 1
+                host_done += 1
+                print("  ok(retry) %-40s %5d chars" % (it["url"][-40:], len(text)))
+            else:
+                failed += 1
+                host_failed += 1
+                print("  EMPTY %s" % it["url"][-46:])
+
+        # Per-host, not just per-run: a portal whose extractor has regressed
+        # shows up here as a high miss rate instead of being averaged away
+        # across the other three.
+        total = host_done + host_failed
+        rate = (100.0 * host_failed / total) if total else 0.0
+        print("--- %s: ok %d, missed %d (%.0f%%) %s" % (
+            host, host_done, host_failed, rate,
+            "*** CHECK THE EXTRACTOR ***" if rate >= 10 and total >= 10 else ""))
+    await asyncio.gather(*(run_host(h, g) for h, g in groups.items()))
+    core.write_json(stage1_path, stage1)
+    print('\n' + "cached %d, failed %d -> %s" % (done, failed, stage1_path))
+
+
+STOP_LABELS = re.compile(
+    r"\s+(?:Council Tax|Deposit|Let available date|Furnish type|Tenancy info|"
+    r"PROPERTY TYPE|BEDROOMS|BATHROOMS|SIZE|Key features|Description)\b", re.I)
+
+
+def clean_value(raw: str) -> str:
+    return STOP_LABELS.split(raw.strip(), 1)[0].strip(" :,-")
+
+
+# Each portal spells the same three filters differently. Value semantics:
+# a price is a CEILING, beds and baths are FLOORS.
+URL_FILTERS = {
+    "maxPrice": ("budget_pcm", "ceiling"),
+    "price_max": ("budget_pcm", "ceiling"),
+    "max-price": ("budget_pcm", "ceiling"),
+    "prices_max": ("budget_pcm", "ceiling"),
+    "minBedrooms": ("min_bedrooms", "floor"),
+    "beds_min": ("min_bedrooms", "floor"),
+    "min-bedrooms": ("min_bedrooms", "floor"),
+    "bedrooms_min": ("min_bedrooms", "floor"),
+    "minBathrooms": ("min_bathrooms", "floor"),
+    "baths_min": ("min_bathrooms", "floor"),
+    "min-bathrooms": ("min_bathrooms", "floor"),
+    "bathrooms_min": ("min_bathrooms", "floor"),
+}
+
+
+def config_url_drift(cfg) -> list:
+    """Thresholds live in TWO places: the config keys the hard filter reads, and
+    the query params baked into each search URL. Nothing keeps them in step.
+
+    Only one direction of drift matters, and it is invisible. A URL that is
+    LOOSER than the config is merely wasteful - the extra listings are fetched
+    and then rejected locally. A URL that is TIGHTER never fetches them at all,
+    so they cannot appear in any digest and the morning looks quiet. Raising
+    UNIT_BUDGET to 5000 while the URLs still say maxPrice=4500 silently deletes
+    the whole band you just opened up.
+
+    Reported, never fatal: a deliberately tighter URL is a legitimate choice.
+    """
+    out = []
+    for url in cfg.searches:
+        host = url.split("/")[2]
+        for param, (key, kind) in URL_FILTERS.items():
+            m = re.search(r"[?&]" + re.escape(param) + r"=(\d+)", url)
+            if not m:
+                continue
+            want = getattr(cfg, key, None)
+            if not isinstance(want, int) or want <= 0:
+                continue
+            got = int(m.group(1))
+            if kind == "ceiling" and got < want:
+                out.append("%s: %s=%d is BELOW %s=%d - listings between %d and "
+                           "%d are never fetched" % (host, param, got, key, want, got, want))
+            elif kind == "floor" and got > want:
+                out.append("%s: %s=%d is ABOVE %s=%d - listings with %d are "
+                           "never fetched" % (host, param, got, key, want, want))
+    # Six Rightmove URLs carrying the same params produce six identical lines.
+    return list(dict.fromkeys(out))
+
+
+async def preflight(cfg: dict | None = None) -> None:
+    """Prove we can actually fetch BEFORE spending an hour finding out we cannot.
+
+    A missing REQUIRED dependency is the easy case - it fails loudly either way.
+    The dangerous one is a missing OPTIONAL dependency, because it degrades in
+    silence: with no Tesseract, floorplan OCR reads nothing, every listing is
+    filed "size not stated", and the run looks completely healthy. That is this
+    project's characteristic bug wearing a different hat, so the absence is
+    announced once, up front, where it cannot be mistaken for a finding.
+
+    Chromium is launched rather than merely located: `pip install playwright`
+    without `playwright install chromium` imports perfectly and then fails on
+    the first navigation, a third of the way into a run.
+    """
+    problems = []
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        sys.exit("FATAL: playwright is not installed.\n"
+                 "  pip install -r requirements.txt\n"
+                 "  python -m playwright install chromium")
+
+    try:
+        pw = await async_playwright().start()
+        try:
+            browser = await pw.chromium.launch(headless=True)
+            await browser.close()
+        finally:
+            await pw.stop()
+    except Exception as exc:
+        problems.append("chromium will not launch: %s" % str(exc)[:160])
+
+    if problems:
+        sys.exit("FATAL: cannot fetch.\n  " + "\n  ".join(problems) +
+                 "\n  python -m playwright install chromium")
+
+    # Optional - degrade, but say so out loud.
+    notes = []
+    if not floorplan.tesseract():
+        notes.append("Tesseract not found - floorplan OCR DISABLED. Listings that "
+                     "state no size will be flagged 'size not stated', NOT sized.")
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        notes.append("Pillow not installed - floorplan detection DISABLED "
+                     "(OpenRent plans are found by appearance).")
+    if cfg is not None:
+        for d in config_url_drift(cfg):
+            notes.append("SEARCH URL IS TIGHTER THAN YOUR CONFIG - " + d)
+    for n in notes:
+        print("  ! %s" % n, flush=True)

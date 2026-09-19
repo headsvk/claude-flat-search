@@ -1,0 +1,24 @@
+# Your config: budget, target areas, dates.
+criteria.toml
+
+# Everything a run writes - state, the portals' cached pages, daily files,
+# logs. One folder, so the repo stays source-only.
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

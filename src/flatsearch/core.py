@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""Flat search - state and funnel bookkeeping.
+
+The browser work is done by fetch.py and the A/C judgement by a model. This
+script owns everything deterministic: state.json, URL dedup, the hard filters,
+and - most importantly - validation of the model's A/C verdicts against the
+page text it actually read. An unbacked claim collapses to `unstated`.
+
+Subcommands:
+  plan     dedupe stage-1 listings, apply hard filters, emit the stage-2 queue
+  commit   validate verdicts and write records, preserving status and stamps
+  report   summarise what is in state.json
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+
+AIRCON_VERDICTS = {"yes", "likely", "no", "unstated"}
+AIRCON_SCOPES = {"in_unit", "communal_only", "unclear"}
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+_WS = re.compile(r"\s+")
+_PUNCT = str.maketrans({
+    "‘": "'", "’": "'", "“": '"', "”": '"',
+    "–": "-", "—": "-", " ": " ",
+})
+
+
+def norm(s: str | None) -> str:
+    """Whitespace/punctuation-insensitive form, for quote matching."""
+    return _WS.sub(" ", (s or "").translate(_PUNCT)).strip().lower()
+
+
+def cache_name(url: str) -> str:
+    return hashlib.sha1(url.strip().encode("utf-8")).hexdigest()[:16] + ".json"
+
+
+def today() -> str:
+    return dt.date.today().isoformat()
+
+
+def parse_date(value) -> dt.date | None:
+    if not value:
+        return None
+    if isinstance(value, dt.date):
+        return value
+    for fmt in ("%Y-%m-%d", "%d %B %Y", "%d %b %Y", "%d/%m/%Y"):
+        try:
+            return dt.datetime.strptime(str(value).strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+
+
+DISTRICT_RE = re.compile('\\b([A-Z]{1,2}\\d{1,2}[A-Z]?)\\b')
+TIER_NAME = {0: "High", 1: "Medium", 2: "Low"}
+
+
+def read_json(path: pathlib.Path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: pathlib.Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# workbook
+# --------------------------------------------------------------------------
+
+def known_urls(cfg: dict) -> set:
+    """Every URL already in state.json - the incremental-search stop set."""
+    path = cfg.state_path
+    if not path.exists():
+        return set()
+    data = read_json(path)
+    return {str(l.get("url", "")).strip()
+            for l in data.get("listings", []) if l.get("url")}
+
+
+def district(listing: dict) -> str | None:
+    """Postcode district (SW3, NW8, E14) - the workable proxy for 'affluent'.
+    Portals always render it, unlike free-text neighbourhood names."""
+    for field in ("postcode", "area"):
+        m = DISTRICT_RE.search(str(listing.get(field) or "").upper())
+        if m:
+            return m.group(1)
+    return None
+
+
+def hard_filter(listing: dict, cfg: dict) -> str | None:
+    """Return a rejection reason, or None if the listing survives stage 1.
+    Unknown values never reject - only a stated value that violates a rule does."""
+    price = listing.get("price_pcm")
+    if isinstance(price, (int, float)) and price > cfg.budget_pcm:
+        return f"over budget (GBP {price:.0f} > {cfg.budget_pcm})"
+
+    beds = listing.get("bed_count")
+    min_beds = cfg.min_bedrooms
+    if min_beds and isinstance(beds, (int, float)) and beds < min_beds:
+        return f"{int(beds)} bed (min {min_beds})"
+    max_beds = cfg.max_bedrooms
+    if max_beds and isinstance(beds, (int, float)) and beds > max_beds:
+        return f"{int(beds)}-bed property (max {max_beds})"
+
+    baths = listing.get("bathrooms")
+    min_baths = cfg.min_bathrooms
+    if min_baths and isinstance(baths, (int, float)) and baths < min_baths:
+        return f"{int(baths)} bath (min {min_baths})"
+
+    # Floor area is published by ~40% of Rightmove/Zoopla listings and ~6% of
+    # OnTheMarket, so this rejects only a STATED size below the floor. Requiring
+    # a size would delete most of the market on missing data.
+    size = listing.get("size_sqft")
+    min_sqft = cfg.min_sqft
+    if min_sqft and isinstance(size, (int, float)) and size < min_sqft:
+        return f"{int(size)} sq ft (min {min_sqft})"
+
+    # Lower ground / basement is an outright no.
+    if str(listing.get("floor_level", "")).strip().lower() in ("lower_ground", "basement"):
+        return "lower ground / basement"
+
+    if cfg.districts_only and not listing.get("area_trusted"):
+        d = district(listing)
+        # An unparseable address ("Richmond, Surrey", a development name) is an
+        # UNKNOWN district, not a bad one - measured at 4 of 9 good Richmond hits.
+        # Unknown never rejects; it is ranked down and flagged instead.
+        if d is not None and cfg.tier_of(d) is None:
+            return f"district {d} not in affluent list"
+    return None
+
+
+def base_tier(listing: dict, cfg: dict) -> tuple[int, list[str]]:
+    notes: list[str] = []
+
+    d = district(listing)
+    tier = cfg.tier_of(d)
+    if tier is None and d is None and listing.get("region_district"):
+        # The search was scoped to this region, which places the listing even
+        # though its address carries no postcode.
+        tier = cfg.tier_of(listing["region_district"])
+        if tier is not None:
+            notes.append("area from %s search" % (listing.get("region_name") or "region"))
+    if tier is None and d is None and (listing.get("area_trusted") or cfg.districts_only):
+        # came from an area search we chose deliberately, but the address
+        # carries no district - keep it, ranked low, and say why
+        tier = 2
+        notes.append("district unconfirmed - verify area")
+    if tier is None:
+        tier = 2
+        notes.append("outside target areas")
+
+    move_in = parse_date(cfg.move_in)
+    if move_in:
+        avail = parse_date(listing.get("available_from"))
+        if avail:
+            slack = cfg.move_in_slack_days
+            if avail > move_in + dt.timedelta(days=slack):
+                tier = min(2, tier + 1)
+                notes.append(f"available {avail.isoformat()}, after move-in window")
+        else:
+            notes.append("availability unconfirmed")
+    # No MOVE_IN_DATE set means timing is flexible - say nothing about dates.
+
+    if cfg.min_bathrooms and listing.get("bathrooms") is None:
+        # OpenRent filters bathrooms server-side but never prints the count, so
+        # the search itself is the evidence - do not flag those as unconfirmed.
+        if listing.get("bathrooms_verified_by_search"):
+            notes.append("bathrooms >= min (verified by search filter)")
+        else:
+            notes.append("bathroom count unconfirmed")
+
+    pref = cfg.furnishing
+    raw = str(listing.get("furnished", "")).strip().lower()
+    if "or unfurnished" in raw or "unfurnished or" in raw:
+        got = pref                      # landlord flexible - satisfies either preference
+        notes.append("landlord flexible on furnishing")
+    elif raw.startswith("part"):
+        got = "part furnished"
+    elif raw in ("no", "unfurnished"):
+        got = "unfurnished"
+    elif raw in ("yes", "furnished"):
+        got = "furnished"
+    else:
+        got = None
+    if pref in ("unfurnished", "furnished"):
+        if got is None:
+            notes.append("furnishing unconfirmed")
+        elif got != pref:
+            tier = min(2, tier + 1)
+            notes.append(f"{got}, prefer {pref}")
+
+    return tier, notes
+
+
+def apply_amenities(tier: int, listing: dict, cfg: dict) -> tuple[int, list[str]]:
+    """Floor, lift and concierge. All of these are prose-only on every portal.
+
+    Nobody advertises the ABSENCE of a lift - measured 0 of 80 listings - so an
+    unstated lift is unknown, not missing, and only ever demotes with a flag.
+    """
+    notes: list[str] = []
+    floor = str(listing.get("floor_level", "") or "").strip().lower()
+    floor_no = listing.get("floor_number")
+    lift = str(listing.get("lift", "") or "").strip().lower()
+
+    if floor == "ground":
+        tier = min(2, tier + 1)
+        notes.append("ground floor")
+    elif floor in ("top", "penthouse"):
+        tier = max(0, tier - 1)
+        notes.append("top floor")
+    elif isinstance(floor_no, int) and floor_no >= cfg.good_floor_from:
+        tier = max(0, tier - 1)
+        notes.append(f"floor {floor_no}")
+
+    lift_from = cfg.lift_required_from_floor
+    if isinstance(floor_no, int) and floor_no >= lift_from:
+        if lift == "yes":
+            notes.append("lift confirmed")
+        else:
+            tier = min(2, tier + 1)
+            notes.append(f"floor {floor_no} and lift {lift or 'unstated'}")
+    elif lift == "yes":
+        notes.append("lift")
+
+    if str(listing.get("concierge", "") or "").lower() == "yes":
+        tier = max(0, tier - 1)
+        notes.append("concierge/porter")
+
+    condition = str(listing.get("condition", "") or "").lower()
+    if condition == "refurbished":
+        tier = max(0, tier - 1)
+        notes.append("refurbished/renovated")
+    elif condition == "needs_work":
+        tier = min(2, tier + 1)
+        notes.append("needs refurbishment")
+
+    size = listing.get("size_sqft")
+    if cfg.min_sqft and not isinstance(size, (int, float)):
+        notes.append("size not stated - verify")
+    elif isinstance(size, (int, float)):
+        notes.append(f"{int(size)} sq ft")
+    return tier, notes
+
+
+def apply_aircon(tier: int, aircon: dict, cfg: dict) -> tuple[int, list[str]]:
+    """Adjust priority by the A/C verdict. in_unit is the only real hit."""
+    notes: list[str] = []
+    mode = cfg.aircon
+    verdict = aircon.get("verdict", "unchecked")
+    scope = aircon.get("scope", "unclear")
+    hit = verdict in ("yes", "likely") and scope == "in_unit"
+
+    if verdict in ("yes", "likely") and scope == "communal_only":
+        notes.append("A/C is communal only, not in the unit")
+
+    if mode == "ignore":
+        return tier, notes
+    if mode == "required":
+        # "unchecked" means we never opened the page - that is not evidence of
+        # absence, so hold the base tier and let a later run decide.
+        if verdict == "unchecked":
+            notes.append("A/C not yet checked - detail page unread")
+            return tier, notes
+        if not hit:
+            notes.append(f"A/C not confirmed in unit ({verdict})")
+            return 2, notes
+        return tier, notes
+    # preferred
+    if hit:
+        tier = max(0, tier - 1)
+        notes.append("A/C in unit")
+    return tier, notes
+
+
+# --------------------------------------------------------------------------
+# verdict validation  (the anti-hallucination gate)
+# --------------------------------------------------------------------------
+
+def validate_verdict(url: str, raw: dict | None, cache_dir: pathlib.Path) -> dict:
+    """Every positive or negative A/C claim must quote text that really appears
+    on the page we cached. Unbacked claims collapse to 'unstated'."""
+    out = {"verdict": "unchecked", "scope": "", "evidence": "", "checked": "", "flags": []}
+    if raw is None:
+        return out
+
+    cache_file = cache_dir / cache_name(url)
+    if not cache_file.exists():
+        out["flags"].append("no cached page text - verdict discarded")
+        return out
+
+    try:
+        page = read_json(cache_file)
+    except json.JSONDecodeError:
+        out["flags"].append("cache file unreadable - verdict discarded")
+        return out
+
+    page_text = norm(page.get("text", ""))
+    out["checked"] = str(page.get("fetched_at", today()))[:10]
+
+    verdict = str(raw.get("verdict", "")).strip().lower()
+    scope = str(raw.get("scope", "")).strip().lower()
+    evidence = (raw.get("evidence") or "").strip()
+
+    if verdict not in AIRCON_VERDICTS:
+        out["verdict"] = "unstated"
+        out["flags"].append("unknown verdict '" + verdict + "' -> unstated")
+        return out
+
+    if verdict == "unstated":
+        out["verdict"] = "unstated"
+        return out
+
+    if not evidence:
+        out["verdict"] = "unstated"
+        out["flags"].append(verdict + " claimed with no quote -> unstated")
+        return out
+
+    if norm(evidence) not in page_text:
+        out["verdict"] = "unstated"
+        out["evidence"] = ""
+        out["flags"].append(verdict + " quote not found in page text -> unstated")
+        return out
+
+    out["verdict"] = verdict
+    out["evidence"] = evidence
+    if verdict in ("yes", "likely"):
+        if scope in AIRCON_SCOPES:
+            out["scope"] = scope
+        else:
+            out["scope"] = "unclear"
+            out["flags"].append("unknown scope '" + scope + "' -> unclear")
+    return out
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def plan(cfg, stage1_path, out_path, cap=None, refresh=False):
+    stage1_path, out_path = pathlib.Path(stage1_path), pathlib.Path(out_path)
+    stage1 = read_json(stage1_path)
+    listings = stage1.get("listings", stage1 if isinstance(stage1, list) else [])
+    known = known_urls(cfg)
+    cache_dir = cfg.cache_dir
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    queue, dupes, rejected, seen = [], [], [], set()
+    refreshed = []
+    for listing in listings:
+        url = str(listing.get("url", "")).strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        if url in known:
+            if not refresh:
+                dupes.append(url)
+                continue
+            refreshed.append(url)
+        reason = hard_filter(listing, cfg)
+        if reason:
+            rejected.append({"url": url, "title": listing.get("title"), "reason": reason})
+            continue
+        tier, _ = base_tier(listing, cfg)
+        cache_file = cache_dir / cache_name(url)
+        queue.append({
+            "url": url,
+            "title": listing.get("title"),
+            "platform": listing.get("platform"),
+            "tier": tier,
+            "cache_path": str(cache_file),
+            "already_cached": cache_file.exists(),
+            "tracked": url in known,
+        })
+
+    queue.sort(key=lambda q: (q["already_cached"], q["tier"]))
+    cap = cap if cap is not None else cfg.stage2_cap
+    uncached = [q for q in queue if not q["already_cached"]]
+    to_fetch = uncached[:cap]
+    deferred = uncached[cap:]
+    for q in deferred:
+        q["deferred"] = True
+
+    payload = {
+        "generated": dt.datetime.now().isoformat(timespec="seconds"),
+        "cap": cap,
+        "fetch": to_fetch,
+        "cached": [q for q in queue if q["already_cached"]],
+        "deferred": deferred,
+        "skipped_duplicates": len(dupes),
+        "rejected": rejected,
+    }
+    write_json(out_path, payload)
+
+    print("stage 1 in          : " + str(len(seen)) + " unique listings")
+    print("already tracked     : " + str(len(dupes)) + " (skipped)")
+    if refresh:
+        print("re-queued (refresh) : " + str(len(refreshed)) +
+              " already-tracked listing(s) - commit needs --update to write them back")
+    print("hard-filtered out   : " + str(len(rejected)))
+    for r in rejected[:8]:
+        print("   - " + r["reason"] + ": " + str(r["title"] or r["url"])[:60])
+    print("already cached      : " + str(len(payload["cached"])) + " (no refetch needed)")
+    print("TO FETCH            : " + str(len(to_fetch)) + "  (cap " + str(cap) + ")")
+    print("deferred to next run: " + str(len(deferred)))
+    print("\nqueue -> " + str(out_path))
+    return payload
+
+
+def load_state(cfg: dict) -> dict:
+    path = cfg.state_path
+    if not path.exists():
+        return {"updated": None, "listings": []}
+    return read_json(path)
+
+
+def save_state(cfg: dict, state: dict) -> None:
+    """Write via a temp file and swap, so an interrupted run cannot truncate it."""
+    state["updated"] = dt.datetime.now().isoformat(timespec="seconds")
+    path = cfg.state_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=1, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+# Fields the pipeline owns and rewrites on every commit. Everything else on a
+# record - status, found_on, reported_on, anything you set - is left alone.
+DERIVED = ("title", "platform", "area", "postcode", "price_pcm", "bills_included",
+           "available_from", "furnished", "bedrooms", "bathrooms", "size_sqft",
+           "size_sqft_plan", "floor", "lift", "concierge", "condition", "contact",
+           "aircon", "aircon_scope", "aircon_evidence", "aircon_checked",
+           "notes", "priority")
+
+
+def commit(cfg, stage1_path, verdicts_path=None, update=False):
+    stage1 = read_json(pathlib.Path(stage1_path))
+    listings = stage1.get("listings", stage1 if isinstance(stage1, list) else [])
+    verdicts = {}
+    if verdicts_path and pathlib.Path(verdicts_path).exists():
+        raw = read_json(pathlib.Path(verdicts_path))
+        for v in raw.get("verdicts", raw if isinstance(raw, list) else []):
+            url = str(v.get("url", "")).strip()
+            if url:
+                verdicts[url] = v.get("aircon", v)
+
+    state = load_state(cfg)
+    by_url = {str(l.get("url", "")).strip(): l for l in state["listings"]}
+    cache_dir = cfg.cache_dir
+    run_date = stage1.get("run_date") or today()
+
+    added = updated = 0
+    rejected_late, flags, ac_counts, seen = [], [], {}, set()
+
+    for listing in listings:
+        url = str(listing.get("url", "")).strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        existing = by_url.get(url)
+
+        reason = hard_filter(listing, cfg)
+        if reason:
+            # A listing already tracked can fail later, once its detail page has
+            # been read - a basement flat, or a stated size under the floor. Say
+            # so on the record rather than leaving it looking untriaged. One not
+            # tracked yet is simply never tracked.
+            if existing:
+                note = "rejected on detail: " + reason
+                if str(existing.get("status", "")).upper() in ("", "NEW"):
+                    existing["status"] = "REJECTED"
+                for key in ("size_sqft", "size_sqft_plan", "floor", "lift", "concierge"):
+                    if listing.get(key):
+                        existing[key] = listing[key]
+                notes = [n for n in str(existing.get("notes") or "").split("; ") if n]
+                if listing.get("size_sqft"):
+                    notes = [n for n in notes if "size not stated" not in n]
+                if note not in notes:
+                    notes.append(note)
+                existing["notes"] = "; ".join(notes)
+                rejected_late.append(str(listing.get("title") or url)[:44] + ": " + reason)
+            continue
+
+        ac = validate_verdict(url, verdicts.get(url), cache_dir)
+        for f in ac["flags"]:
+            flags.append(str(listing.get("title") or url)[:48] + ": " + f)
+        ac_counts[ac["verdict"]] = ac_counts.get(ac["verdict"], 0) + 1
+
+        tier, notes = base_tier(listing, cfg)
+        tier, am_notes = apply_amenities(tier, listing, cfg)
+        notes += am_notes
+        tier, ac_notes = apply_aircon(tier, ac, cfg)
+        notes += ac_notes
+        if listing.get("notes"):
+            notes.insert(0, str(listing["notes"]))
+        if listing.get("size_sqft_plan") and not listing.get("size_sqft"):
+            notes.append("size %d sq ft read off the floorplan%s - verify"
+                         % (listing["size_sqft_plan"],
+                            "" if listing.get("size_plan_confident") else " (AMBIGUOUS)"))
+
+        record = {
+            "url": url,
+            "title": listing.get("title"),
+            "platform": listing.get("platform"),
+            "area": listing.get("area"),
+            "postcode": listing.get("postcode"),
+            "price_pcm": listing.get("price_pcm"),
+            "bills_included": listing.get("bills_included", "Unknown"),
+            "available_from": listing.get("available_from"),
+            "furnished": listing.get("furnished", "Unknown"),
+            "bedrooms": listing.get("bed_count"),
+            "bathrooms": listing.get("bathrooms"),
+            "size_sqft": listing.get("size_sqft"),
+            "size_sqft_plan": listing.get("size_sqft_plan"),
+            "floor": listing.get("floor_level") or listing.get("floor_number"),
+            "lift": listing.get("lift"),
+            "concierge": listing.get("concierge"),
+            "condition": listing.get("condition"),
+            "contact": listing.get("contact"),
+            "aircon": ac["verdict"],
+            "aircon_scope": ac["scope"],
+            "aircon_evidence": ac["evidence"],
+            "aircon_checked": ac["checked"],
+            "notes": "; ".join(n for n in notes if n),
+            "priority": TIER_NAME[tier],
+        }
+
+        if existing:
+            for key in DERIVED:
+                existing[key] = record.get(key)
+            existing["last_seen"] = run_date
+            updated += 1
+        else:
+            record["status"] = "NEW"
+            record["found_on"] = run_date
+            record["last_seen"] = run_date
+            record["reported_on"] = None
+            state["listings"].append(record)
+            by_url[url] = record
+            added += 1
+
+    save_state(cfg, state)
+    print("state: " + str(cfg.state_path))
+    print("added %d, updated %d, tracked total %d" % (added, updated, len(state["listings"])))
+    ac_line = ", ".join(k + "=" + str(v) for k, v in sorted(ac_counts.items()))
+    print("A/C verdicts: " + (ac_line or "none"))
+    if rejected_late:
+        print("")
+        print("DISQUALIFIED BY THEIR DETAIL PAGE - %d marked REJECTED:" % len(rejected_late))
+        for r in rejected_late[:12]:
+            print("   x " + r)
+        if len(rejected_late) > 12:
+            print("   ... and %d more" % (len(rejected_late) - 12))
+    if flags:
+        print("")
+        print("VALIDATION - %d verdict(s) downgraded:" % len(flags))
+        for f in flags:
+            print("   ! " + f)
+
+
+def report(cfg):
+    state = load_state(cfg)
+    listings = state["listings"]
+    live = [l for l in listings
+            if str(l.get("status", "")).upper() not in ("REJECTED", "DISMISSED", "GONE")]
+    print("tracked %d  |  live %d  ·  ruled out %d"
+          % (len(listings), len(live), len(listings) - len(live)))
+    for field in ("priority", "status", "aircon"):
+        tally = {}
+        for l in listings:
+            key = l.get(field) or "(blank)"
+            tally[key] = tally.get(key, 0) + 1
+        print("  %-9s %s" % (field, "  ".join("%s=%d" % kv for kv in sorted(tally.items(), key=lambda x: str(x[0])))))
+    unseen = sum(1 for l in live if not l.get("reported_on"))
+    if unseen:
+        print("  %d live listing(s) not yet written to a daily file" % unseen)
