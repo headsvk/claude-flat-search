@@ -1,8 +1,8 @@
-# flat-search
+# UK flat search, read by Claude
 
-A London rental search that runs itself every morning and hands you a short list of
-only what is new, ranked, with the things the portals will not let you filter on
-already read out of the listing text.
+A rental search that runs itself every morning and hands you a short list of only
+what is new, ranked, with the things the portals will not let you filter on already
+read out of the listing text.
 
 It exists because the filters on Rightmove, Zoopla, OnTheMarket and OpenRent cannot
 express what most people actually want. You can filter on bedrooms and price. You
@@ -10,8 +10,19 @@ cannot filter on *floor area over 800 sq ft*, *not a basement*, *has a lift if i
 above the third floor*, or *air conditioning in the flat rather than in the residents'
 gym*. Those live in the prose, so this reads the prose.
 
-Four portals, one browser each, run concurrently. Roughly 650 listings tracked on a
-normal week; a morning run turns up a handful of genuinely new ones.
+Four portals, one browser each, run concurrently. How many listings that comes to is
+entirely a function of your criteria — a wide net over a city runs to several hundred
+tracked at a time, a narrow one to a few dozen. Either way a morning run turns up a
+handful of genuinely new ones, which is the number that matters.
+
+All four portals are national, and nothing in the filtering knows what a London
+postcode is, so this works anywhere in the UK. The worked example is London because
+that is where it was built and measured; [Outside London](#outside-london) is the
+two things you change.
+
+> **You do not have to set this up by hand.** Everything below — installing it,
+> writing the config, working out the search URLs, running it on a schedule — is
+> work you can hand to a coding agent. See [Let an agent set it up](#let-an-agent-set-it-up).
 
 ## How it works
 
@@ -27,17 +38,7 @@ normal week; a morning run turns up a handful of genuinely new ones.
 | `commit` | Validates every claim against the cached page, then writes state. |
 | `render` | Writes today's "what's new" file and regenerates the full shortlist, duplicate ads collapsed. |
 
-Two design choices carry most of the weight.
-
-A third choice follows from the first two. **The output collapses duplicate ads but
-never duplicate flats.** One flat is routinely several rows — cross-listed on two
-portals, or a new-build block marketing every unit it has under one address. Ads that
-agree on price, address and bed/bath count and contradict each other on nothing they
-state become one row carrying every link; flats that merely share a building stay
-separate rows, marked with how many the block has going. Measured on one live set:
-840 ads for 778 flats, and four ads at the same price in the same block sitting on
-two different floors — which is why agreement on the *stated* fields is required
-before anything merges.
+Two design choices carry most of the weight, and a third follows from them.
 
 **Unknown never rejects.** An unstated size, district, bathroom count or lift is
 recorded and flagged, never treated as absence. About 60% of listings state no floor
@@ -56,6 +57,55 @@ worse than no claim.
 The model is also kept off the easy 95%: a listing whose text contains no cooling
 vocabulary at all is decided in Python, because `unstated` is a claim about the
 absence of vocabulary and a word list settles it exactly.
+
+A third choice follows from the first two. **The output collapses duplicate ads but
+never duplicate flats.** One flat is routinely several rows — cross-listed on two
+portals, or a new-build block marketing every unit it has under one address. Ads that
+agree on price, address and bed/bath count and contradict each other on nothing they
+state become one row carrying every link; flats that merely share a building stay
+separate rows, marked with how many the block has going. Measured on one live set:
+840 ads for 778 flats, and four ads at the same price in the same block sitting on
+two different floors — which is why agreement on the *stated* fields is required
+before anything merges.
+
+---
+
+*Everything above is the idea. Everything below is operating it — and you can read it
+or delegate it.*
+
+## Let an agent set it up
+
+The setup is fiddly in a way that is tedious rather than difficult: a Python toolchain,
+a Chromium binary, an OCR binary in a place that is not on `PATH`, a TOML file of
+thresholds, and four search URLs whose query parameters have to agree with those
+thresholds. None of it needs judgement. All of it is exactly what a coding agent is
+good at, and this repo is built so one can do it end to end.
+
+Open [Claude Code](https://claude.com/claude-code) in a clone of this repo and say:
+
+```
+Read README.md and docs/runbook.md, then set this up for me.
+I want: <how many bedrooms, how many bathrooms, budget per month,
+which city and which areas, minimum size, move-in date>.
+Install everything, write criteria.toml, work out the search URLs
+for all four portals, and run `flat-search check` until it is clean.
+```
+
+It has what it needs to finish: `check` validates the config, names every unknown key,
+and warns when a search URL is tighter than your thresholds — so the agent has a real
+gate to work against rather than having to guess whether it got it right. The test
+suite is the other gate; `uv run python -m unittest discover -s tests` either passes
+or does not.
+
+Two things to keep for yourself. **The criteria are a judgement call** — which areas,
+what you will pay, what you will not live without — and an agent guessing them is how
+you end up with a tracker full of the wrong flats. Say them out loud in the prompt.
+And **read the [Scope and etiquette](#scope-and-etiquette) section yourself** before
+pointing it at anything, because that is a decision about how you treat someone else's
+servers, not a configuration value.
+
+The rest of this file is the same instructions written out, for reading directly or
+for the agent to follow.
 
 ## Getting it running
 
@@ -125,6 +175,30 @@ flagged and 4 were new. A page rewritten under a stored verdict is re-flagged ra
 than carried, because `commit` would otherwise collapse the stale quote to `unstated`
 and the listing would never be read again.
 
+## Outside London
+
+Nothing in the filtering is London-specific. Postcode districts are parsed from the
+general UK outward-code format, so `M3`, `WA14` and `EH10` behave exactly as `SW3`
+does, and the stem fallback that maps `SW1X` to `SW1` maps `EC1A` to `EC1` the same
+way. All four portals are national. Two things change:
+
+**The search URLs**, which encode the location. Build each one in the portal's own UI
+for the city you want, then paste it into `[searches]` and run `flat-search check` —
+it will tell you if a URL is tighter than your thresholds.
+
+**The district lists**, which are what `prime`, `affluent` and `fringe` mean to you.
+These are outward codes, not names: `m3`, `m20`, `wa14` rather than Deansgate,
+Didsbury, Altrincham. An unlisted district is never rejected on that basis unless you
+set `only = true`; it is ranked low and flagged.
+
+One London-only convenience is worth knowing about because its absence is silent.
+`REGION_DISTRICT` in [fetch.py](src/flatsearch/fetch.py) maps five Rightmove region
+IDs to the districts they cover, so a listing advertised as "Richmond, Surrey" with no
+postcode in its address still gets placed. Elsewhere there is no such mapping, and
+those listings are kept, ranked low and flagged `district unconfirmed - verify area`
+rather than dropped. Add your own entries if a region you search often advertises
+without postcodes; the run works without them.
+
 ## Layout
 
     criteria.toml            your thresholds and search URLs (gitignored)
@@ -155,7 +229,7 @@ shortlist is for looking something up.
 
     uv run python -m unittest discover -s tests -v
 
-204 tests, no dependencies beyond the standard library. `pytest` will collect them
+228 tests, no dependencies beyond the standard library. `pytest` will collect them
 too if you prefer it. The OCR tests draw their own floorplans with Pillow rather than
 committing image fixtures, so the repo carries no third-party content and no binaries;
 the end-to-end OCR cases skip themselves where Tesseract is absent.
@@ -167,8 +241,9 @@ mentioned". One end anchor matching mid-line — OpenRent's stock copy says "a f
 great location", which matched the `Location` heading anchor — truncated descriptions
 below the minimum length and dropped 22% of that portal's fetches with no error at all.
 The suite is verified by mutation: reintroducing each of those bugs turns it red —
-including the later ones, where deleting `judge.run`'s `return` fails seven tests and
-merging two ads that state different floors fails two.
+including the later ones, where deleting `judge.run`'s `return` fails seven tests,
+merging two ads that state different floors fails two, and letting `commit` write an
+`unchecked` verdict over a confirmed one fails two.
 
 `fetch.py` also refuses to start a run it cannot finish. A missing `playwright` or an
 uninstalled chromium aborts with the fix command; a missing Tesseract only warns, but
@@ -186,6 +261,10 @@ entries are never refetched.
 the traps behind them. It is written for an LLM agent, but it is worth reading
 yourself even if you never automate anything, because it carries what a command
 list cannot — the ordering, and the rules about when *not* to proceed.
+
+This is the other half an agent can do for you — ask it to set up the scheduled task
+as well and it will follow the same runbook. What follows is what it should end up
+with, and what you would write by hand.
 
 To run it on a schedule with Claude Code, create a scheduled task that **points at
 this file rather than copying it**:
@@ -238,14 +317,6 @@ reason as much as for privacy.
 
 It does not contact agents, submit enquiries, or fill in anything. It reads listings and
 ranks them; talking to a human being about a flat is still your job.
-
-## Credit
-
-This started life as a fork of
-[mikepapadim/london-property-hunt-public](https://github.com/mikepapadim/london-property-hunt-public),
-which searches for rooms in shared flats. The whole-flat rewrite kept none of its code —
-that repo is a prose skill-prompt with no Python in it — but it is where the idea came
-from, and credit is cheap.
 
 ## Licence
 
