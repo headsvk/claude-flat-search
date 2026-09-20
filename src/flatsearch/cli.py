@@ -88,10 +88,31 @@ def stage_render(cfg) -> None:
 
 def cmd_run(args) -> int:
     cfg = _load(args)
+    # Before anything touches state: the report at the end has to be able to
+    # say what THIS run changed, not just what the totals are. `finish` reuses
+    # the same baseline, so the delta spans the whole morning.
+    core.write_baseline(cfg)
     stage1 = stage_search(cfg, args)
     stage_audit(cfg, stage1)
     stage_details(cfg, stage1, args)
     pending = stage_judge(cfg, stage1)
+    # `judge` returns how many listings a model still has to read. Nothing may
+    # commit while that is non-zero: an uncommitted listing can wait, but a
+    # listing committed `unchecked` is stamped into a daily file it only ever
+    # gets one of, and the judged version is never shown.
+    #
+    # The type check is not paranoia. `judge.run` once fell off the end
+    # returning None, None is falsy, and the effect was not an error but a run
+    # that committed 43 unjudged listings and looked perfectly healthy doing
+    # it. A missing count has to be loud, because a quiet one commits.
+    if not isinstance(pending, int):
+        raise Abort(
+            "JUDGE DID NOT REPORT A COUNT - not committing.\n"
+            "It returned %r, so this run cannot tell 'nothing to judge' from\n"
+            "'judgement was skipped'. Committing on that guess would stamp\n"
+            "unjudged listings into today's file, and each listing gets one.\n"
+            "Fix judge.run to return the number still needing a model."
+            % (pending,))
     if pending:
         print()
         print("=" * 72)

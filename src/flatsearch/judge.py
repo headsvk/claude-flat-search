@@ -25,6 +25,7 @@ human/model, never upgrade. It cannot emit `yes` on its own.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import pathlib
 import re
 import sys
@@ -173,8 +174,86 @@ def windows(text: str, hits: list, pad: int = WINDOW) -> str:
     return GAP.join(text[a:b] for a, b in merged)
 
 
+# --------------------------------------------------------------------------
+# carrying verdicts forward
+# --------------------------------------------------------------------------
+
+def text_sha(text: str) -> str:
+    """Fingerprint of the page a verdict was made against.
+
+    Normalised first, so a whitespace change on the portal does not look like
+    a rewritten description and send a settled listing back to the model.
+    """
+    return hashlib.sha256(core.norm(text).encode("utf-8")).hexdigest()[:16]
+
+
+def load_judged(cfg) -> tuple[dict, list]:
+    """Model verdicts from earlier runs that the current page still supports.
+
+    `run` scans the whole cache, so a listing that mentions cooling is a
+    candidate every single morning for as long as it is tracked. Measured
+    2026-09-20: 43 flagged, 4 of them genuinely new - the other 39 already had
+    a verdict, and diffing them out was a manual step done by hand in the
+    session. It is done here instead.
+
+    A carried-forward verdict is only safe while the page it quotes is
+    unchanged. `commit` already collapses a claim whose quote has vanished,
+    but that is a SILENT downgrade: the listing lands on `unstated` and is
+    never read again. Comparing the fingerprint re-flags it for judgement
+    instead, which is the only outcome that recovers.
+
+    -> ({url: verdict}, [urls whose page changed under a stored verdict])
+    """
+    path = cfg.runs_dir / "verdicts_haiku.json"
+    if not path.exists():
+        return {}, []
+    try:
+        stored = core.read_json(path).get("verdicts", [])
+    except (ValueError, OSError):
+        return {}, []
+
+    judged, stale = {}, []
+    for v in stored:
+        url = str(v.get("url", "")).strip()
+        if not url:
+            continue
+        # Only the handful of pages that actually carry a verdict, addressed
+        # directly. Walking the whole cache to find them reads every listing
+        # twice for the sake of a few dozen.
+        cache_file = cfg.cache_dir / core.cache_name(url)
+        if not cache_file.exists():
+            continue
+        try:
+            text = core.read_json(cache_file).get("text", "")
+        except (ValueError, OSError):
+            continue
+        sha = str(v.get("text_sha", "") or "")
+        if sha:
+            fresh = sha == text_sha(text)
+        else:
+            # Written before verdicts carried a fingerprint. Fall back to the
+            # quote itself, which is the same test `commit` applies; a verdict
+            # with nothing to quote has nothing that can go stale.
+            evidence = (v.get("aircon") or {}).get("evidence") or ""
+            fresh = not evidence.strip() or core.norm(evidence) in core.norm(text)
+        if fresh:
+            carried = {"url": url, "aircon": v.get("aircon") or {}}
+            judged[url] = carried
+        else:
+            stale.append(url)
+    return judged, stale
+
+
 def run(cfg, out_path, review_path, stage1_path=None) -> int:
-    """-> how many listings still need a model's judgement."""
+    """-> how many listings still need a model's judgement.
+
+    That return value is the whole point of the stage: `flat-search run` uses
+    it to decide whether to stop and ask, or to go on and commit. It was
+    missing for a while - the function fell off the end returning None - and
+    the effect was not a crash but a run that committed 43 unjudged listings
+    as `unchecked` and wrote them into a daily file, which a listing only ever
+    gets one of. Keep the return.
+    """
     out_path, review_path = pathlib.Path(out_path), pathlib.Path(review_path)
     cache = cfg.cache_dir
     files = sorted(cache.glob("*.json"))
@@ -185,8 +264,10 @@ def run(cfg, out_path, review_path, stage1_path=None) -> int:
     stage1 = core.read_json(stage1_path) if stage1_path and stage1_path.exists() else None
     by_url = {l["url"]: l for l in stage1["listings"]} if stage1 else {}
     amen_counts = {}
+    judged, stale = load_judged(cfg)
 
     verdicts, review, decoy_hits, thin = [], [], [], []
+    carried = 0
     for f in files:
         j = core.read_json(f)
         text, url = j.get("text", ""), j.get("url", "")
@@ -201,12 +282,20 @@ def run(cfg, out_path, review_path, stage1_path=None) -> int:
         hits, decoys = scan(text)
         if decoys:
             decoy_hits.append((url, decoys))
-        if hits:
-            review.append({"url": url, "terms": hits, "cache_file": str(f),
-                           "text": windows(text, hits), "text_chars": len(text)})
-        else:
+        if not hits:
             verdicts.append({"url": url,
                              "aircon": {"verdict": "unstated", "scope": "", "evidence": ""}})
+        elif url in judged:
+            # Already read by a model, against this same page. Fold the stored
+            # verdict straight into verdicts.json so a run with nothing new can
+            # commit it without waiting for `finish`.
+            verdicts.append(judged[url])
+            carried += 1
+        else:
+            review.append({"url": url, "terms": hits, "cache_file": str(f),
+                           "text": windows(text, hits), "text_chars": len(text),
+                           "text_sha": text_sha(text),
+                           "rejudge": url in stale})
 
     core.write_json(out_path, {"verdicts": verdicts})
     core.write_json(review_path, {"needs_model_judgement": review})
@@ -215,10 +304,14 @@ def run(cfg, out_path, review_path, stage1_path=None) -> int:
         core.write_json(stage1_path, stage1)
         print("amenities extracted: %s" % (dict(sorted(amen_counts.items())) or "none"))
     print("cached listings   : %d" % len(files))
-    print("silent -> unstated: %d  (decided here, no model)" % len(verdicts))
+    print("silent -> unstated: %d  (decided here, no model)" % (len(verdicts) - carried))
+    print("already judged    : %d  (verdict carried forward, page unchanged)" % carried)
+    if stale:
+        print("re-judge          : %d  (page changed under a stored verdict)" % len(stale))
     print("NEEDS JUDGEMENT   : %d  -> %s" % (len(review), review_path))
     for r in review:
-        print("   ! %s  terms=%s" % (r["url"].rsplit("/", 1)[-1], r["terms"]))
+        print("   ! %s  terms=%s%s" % (r["url"].rsplit("/", 1)[-1], r["terms"],
+                                       "  [re-judge]" if r.get("rejudge") else ""))
     if decoy_hits:
         print("\nnear-misses (NOT A/C, listed so they are visible):")
         for url, d in decoy_hits[:10]:
@@ -230,6 +323,7 @@ def run(cfg, out_path, review_path, stage1_path=None) -> int:
     print("\nIf NEEDS JUDGEMENT is 0, verdicts.json is complete: run core.py commit.")
     print("Otherwise judge those entries for scope (in_unit vs communal_only)")
     print("with a verbatim quote, append them to verdicts.json, then commit.")
+    return len(review)
 
 
 if __name__ == "__main__":
@@ -262,4 +356,39 @@ def merge_verdicts(cfg) -> int:
             if url:
                 merged[url] = v
     core.write_json(base, {"verdicts": list(merged.values())})
+    stamp_judged(cfg, extra)
     return len(merged)
+
+
+def stamp_judged(cfg, path) -> int:
+    """Record which page each model verdict was read off, in that file.
+
+    Without this the verdict is just a claim with no date on it, and the next
+    run cannot tell a settled listing from one whose description has since
+    been rewritten. The fingerprint is what lets `load_judged` carry a verdict
+    forward instead of paying for it again, and what makes a changed page
+    re-flag rather than quietly collapse to `unstated` at commit.
+    """
+    path = pathlib.Path(path)
+    if not path.exists():
+        return 0
+    try:
+        data = core.read_json(path)
+    except (ValueError, OSError):
+        return 0
+    stamped = 0
+    for v in data.get("verdicts", []):
+        url = str(v.get("url", "")).strip()
+        if not url:
+            continue
+        cache_file = cfg.cache_dir / core.cache_name(url)
+        if not cache_file.exists():
+            continue
+        try:
+            text = core.read_json(cache_file).get("text", "")
+        except (ValueError, OSError):
+            continue
+        v["text_sha"] = text_sha(text)
+        stamped += 1
+    core.write_json(path, data)
+    return stamped

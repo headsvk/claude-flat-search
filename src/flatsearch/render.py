@@ -19,6 +19,8 @@ import json
 import pathlib
 import re
 
+from . import core
+
 RANK = {"High": 0, "Medium": 1, "Low": 2}
 DECISION_RE = re.compile(r"^\s*-\s*\[(?P<status>[^\]]*)\]\s*(?P<url>https?://\S+)\s*(?:—|-|:)?\s*(?P<note>.*)$")
 
@@ -82,18 +84,121 @@ def flags(listing: dict) -> str:
     return ", ".join(out) or "–"
 
 
-def table(rows: list) -> list:
+# --------------------------------------------------------------------------
+# duplicates and buildings
+# --------------------------------------------------------------------------
+#
+# One flat is routinely several rows. The same unit is listed on Rightmove and
+# Zoopla at once, and a new-build block puts every unit it has on the market
+# under one address. Measured on the live set 2026-09-20: 840 ads for 778
+# flats - 62 redundant rows across 56 merged groups, 36 of them spanning more
+# than one portal, and 95 addresses carrying more than one live listing.
+# Nothing in the output said so, so it was caught by eyeballing the table
+# before quoting a headline count.
+#
+# Two different things, kept apart on purpose:
+#   duplicate  same price, beds, baths and address, contradicting each other
+#              on nothing they state. Collapsed to a single row carrying every
+#              link - see AGREE_ON for what "contradicting" means.
+#   building   same address, different flats. Never collapsed - they are real,
+#              separate options - but annotated, because five rows from one
+#              block is a fact about the block, not five finds.
+
+_ADDR_DROP = {"london", "the", "uk", "greater"}
+
+
+def addr_key(listing: dict) -> str:
+    raw = listing.get("postcode") or listing.get("area") or ""
+    words = re.sub(r"[^a-z0-9 ]", " ", str(raw).lower()).split()
+    return " ".join(w for w in words if w not in _ADDR_DROP)[:40]
+
+
+def dupe_key(listing: dict):
+    """None when there is not enough to be sure - an unknown never merges rows."""
+    price, addr = listing.get("price_pcm"), addr_key(listing)
+    if not price or not addr:
+        return None
+    return (price, listing.get("bedrooms"), listing.get("bathrooms"), addr)
+
+
+# Fields that must not CONTRADICT each other for two ads to be one flat. A
+# blank does not block the merge - most listings state neither - but two
+# stated values that disagree do. Measured 2026-09-20: four ads at GBP 3,700
+# in The Canopy shared a price, an address and a bed/bath count, and sat on
+# two different floors. Merging on price alone called them one flat, which is
+# a claim the data itself contradicts.
+AGREE_ON = ("floor", "size_sqft", "size_sqft_plan")
+
+
+def mergeable(a: dict, b: dict) -> bool:
+    if dupe_key(a) is None or dupe_key(a) != dupe_key(b):
+        return False
+    for field in AGREE_ON:
+        x, y = a.get(field), b.get(field)
+        if x and y and str(x) != str(y):
+            return False
+    return True
+
+
+def group_dupes(rows: list) -> list:
+    """Rows in the order given, each group being one flat as far as anything
+    stated can tell. Order is preserved, so the representative is whatever
+    `order` already ranked highest."""
+    groups: list = []
+    for l in rows:
+        for g in groups:
+            if mergeable(g[0], l):
+                g.append(l)
+                break
+        else:
+            groups.append([l])
+    return groups
+
+
+def building_counts(listings: list) -> dict:
+    """How many live listings share each address, across the whole tracker -
+    not just this file, so a row can say the block has six units going even
+    when five of them turned up last week."""
+    out: dict = {}
+    for l in listings:
+        if not is_live(l):
+            continue
+        key = addr_key(l)
+        if key:
+            out[key] = out.get(key, 0) + 1
+    return out
+
+
+def links(group: list) -> str:
+    return ", ".join("[%s](%s)" % (str(l.get("platform") or "link"), l.get("url"))
+                     for l in group)
+
+
+def table(rows: list, buildings: dict | None = None) -> list:
     out = ["| £pcm | area | sqft | fl | beds/bath | notable | listing |",
            "|---|---|---|---|---|---|---|"]
-    for l in rows:
-        out.append("| %s | %s | %s | %s | %s/%s | %s | [%s](%s) |" % (
+    for group in group_dupes(rows):
+        l = group[0]
+        note = flags(l)
+        extra = []
+        if len(group) > 1:
+            # Not "one flat": the ads agree on everything they state, which
+            # is as far as this can honestly go. The links are all here so
+            # the call can be made by looking.
+            extra.append("%d near-identical ads" % len(group))
+        n = (buildings or {}).get(addr_key(l), 0)
+        if n > len(group):
+            extra.append("%d units in this building" % n)
+        if extra:
+            note = "%s · %s" % (note, "; ".join(extra)) if note != "–" else "; ".join(extra)
+        out.append("| %s | %s | %s | %s | %s/%s | %s | %s |" % (
             money(l.get("price_pcm")),
             cell(l.get("postcode") or l.get("area")),
             size_cell(l),
             cell(l.get("floor"), "–"),
             cell(l.get("bedrooms"), "?"), cell(l.get("bathrooms"), "?"),
-            flags(l),
-            str(l.get("platform") or "link"), l.get("url")))
+            note,
+            links(group)))
     return out
 
 
@@ -103,8 +208,10 @@ def order(rows: list) -> list:
                                        l.get("price_pcm") or 10 ** 9))
 
 
-def is_live(l: dict) -> bool:
-    return str(l.get("status", "")).upper() not in ("REJECTED", "DISMISSED", "GONE")
+# One definition of live, shared with `report`. Two copies of this list would
+# drift, and the day they disagree the daily file and the report are counting
+# different sets of listings while both look right.
+is_live = core.is_live
 
 
 HOLD_DAYS = 7
@@ -162,6 +269,8 @@ def render_daily(state: dict, decisions: dict, day: str) -> tuple:
     dead = [l for l in todays if not is_live(l)]
 
     ac = [l for l in live if l.get("aircon") == "yes"]
+    buildings = building_counts(listings)
+    distinct = len(group_dupes(live))
     out = ["# New listings — %s" % day, ""]
     if not live and not dead:
         out += ["Nothing new today.", ""]
@@ -170,8 +279,10 @@ def render_daily(state: dict, decisions: dict, day: str) -> tuple:
                     "will appear once it is read." % len(held), ""]
         return '\n'.join(out), [], held, 0
 
-    out += ["**%d new** · %d with A/C in unit · %d ruled out before you saw them"
-            % (len(live), len(ac), len(dead)), "",
+    out += ["**%d new**%s · %d with A/C in unit · %d ruled out before you saw them"
+            % (len(live),
+               " (%d distinct flats)" % distinct if distinct != len(live) else "",
+               len(ac), len(dead)), "",
             "Sizes marked `*` were read off a floorplan by OCR, not stated by the agent.",
             "Record any call in `decisions.md`. Earlier days are in this folder.", ""]
     if held:
@@ -181,7 +292,11 @@ def render_daily(state: dict, decisions: dict, day: str) -> tuple:
     for tier in ("High", "Medium", "Low"):
         rows = [l for l in live if str(l.get("priority")) == tier]
         if rows:
-            out += ["## %s — %d" % (tier, len(rows)), ""] + table(rows) + [""]
+            groups = len(group_dupes(rows))
+            head = "## %s — %d" % (tier, groups)
+            if groups != len(rows):
+                head += " (%d ads)" % len(rows)
+            out += [head, ""] + table(rows, buildings) + [""]
 
     if dead:
         out += ["## Ruled out on sight — %d" % len(dead), "",
@@ -226,10 +341,14 @@ def render(state: dict, decisions: dict, limit_low: int = 60) -> str:
     dead = [l for l in listings if not is_live(l)]
 
     today = dt.date.today().isoformat()
+    buildings = building_counts(listings)
+    distinct = len(group_dupes(live))
     ac = sum(1 for l in live if l.get("aircon") == "yes")
     out = ["# Flat shortlist", "",
-           "%s · **%d live** · %d with A/C in unit · %d ruled out"
-           % (today, len(live), ac, len(dead)), "",
+           "%s · **%d live**%s · %d with A/C in unit · %d ruled out"
+           % (today, len(live),
+              " (%d distinct flats)" % distinct if distinct != len(live) else "",
+              ac, len(dead)), "",
            "Sizes marked `*` were read off a floorplan by OCR, not stated by the agent.",
            "To record a call, add a line to `decisions.md` — this file is regenerated every run.",
            ""]
@@ -239,18 +358,11 @@ def render(state: dict, decisions: dict, limit_low: int = 60) -> str:
         if not rows:
             continue
         shown = rows if tier != "Low" else rows[:limit_low]
-        out += ["## %s — %d" % (tier, len(rows)), "",
-                "| £pcm | area | sqft | fl | beds/bath | notable | listing |",
-                "|---|---|---|---|---|---|---|"]
-        for l in shown:
-            out.append("| %s | %s | %s | %s | %s/%s | %s | [%s](%s) |" % (
-                money(l.get("price_pcm")),
-                cell(l.get("postcode") or l.get("area")),
-                size_cell(l),
-                cell(l.get("floor"), "–"),
-                cell(l.get("bedrooms"), "?"), cell(l.get("bathrooms"), "?"),
-                flags(l),
-                str(l.get("platform") or "link"), l.get("url")))
+        groups = len(group_dupes(rows))
+        head = "## %s — %d" % (tier, groups)
+        if groups != len(rows):
+            head += " (%d ads)" % len(rows)
+        out += [head, ""] + table(shown, buildings)
         if len(shown) < len(rows):
             out.append("")
             out.append("_%d more %s listings in `state.json`._" % (len(rows) - len(shown), tier))

@@ -23,11 +23,21 @@ normal week; a morning run turns up a handful of genuinely new ones.
 | `audit` | Per-portal field coverage. Refuses to certify a portal it has not sampled. |
 | `plan` | Dedupes against what is already tracked, applies the hard filters, emits a fetch queue. |
 | `details` | Fetches each listing page and extracts the description, amenities and floor area. |
-| `judge` | Decides air conditioning. Deterministic for the silent majority; a model for the rest. |
+| `judge` | Decides air conditioning. Deterministic for the silent majority; a model for the rest, once each. |
 | `commit` | Validates every claim against the cached page, then writes state. |
-| `render` | Writes today's "what's new" file and regenerates the full shortlist. |
+| `render` | Writes today's "what's new" file and regenerates the full shortlist, duplicate ads collapsed. |
 
 Two design choices carry most of the weight.
+
+A third choice follows from the first two. **The output collapses duplicate ads but
+never duplicate flats.** One flat is routinely several rows — cross-listed on two
+portals, or a new-build block marketing every unit it has under one address. Ads that
+agree on price, address and bed/bath count and contradict each other on nothing they
+state become one row carrying every link; flats that merely share a building stay
+separate rows, marked with how many the block has going. Measured on one live set:
+840 ads for 778 flats, and four ads at the same price in the same block sitting on
+two different floors — which is why agreement on the *stated* fields is required
+before anything merges.
 
 **Unknown never rejects.** An unstated size, district, bathroom count or lift is
 recorded and flagged, never treated as absence. About 60% of listings state no floor
@@ -101,6 +111,20 @@ verdicts where it tells you, then:
 
     uv run flat-search finish
 
+**`run` refuses to commit while a listing is still unjudged**, for the same reason it
+refuses after a failed search: committing stamps a listing into a daily file it only
+ever gets one of, so a listing committed `unchecked` can never be shown judged. That
+refusal is also why `judge` must return a count and `run` aborts if it does not —
+falling off the end returning `None` made the check silently always-false, and one
+morning's run committed 43 unjudged listings and looked perfectly healthy doing it.
+
+`finish` records which page each verdict was read off, so the next run carries it
+forward instead of paying a model to read the same listing again. A listing that
+mentions cooling is otherwise a candidate every single morning: on one run, 43 were
+flagged and 4 were new. A page rewritten under a stored verdict is re-flagged rather
+than carried, because `commit` would otherwise collapse the stale quote to `unstated`
+and the listing would never be read again.
+
 ## Layout
 
     criteria.toml            your thresholds and search URLs (gitignored)
@@ -131,7 +155,7 @@ shortlist is for looking something up.
 
     uv run python -m unittest discover -s tests -v
 
-164 tests, no dependencies beyond the standard library. `pytest` will collect them
+204 tests, no dependencies beyond the standard library. `pytest` will collect them
 too if you prefer it. The OCR tests draw their own floorplans with Pillow rather than
 committing image fixtures, so the repo carries no third-party content and no binaries;
 the end-to-end OCR cases skip themselves where Tesseract is absent.
@@ -142,7 +166,9 @@ produces a perfectly healthy-looking tracker in which every listing says "no A/C
 mentioned". One end anchor matching mid-line — OpenRent's stock copy says "a flat in a
 great location", which matched the `Location` heading anchor — truncated descriptions
 below the minimum length and dropped 22% of that portal's fetches with no error at all.
-The suite is verified by mutation: reintroducing each of those six bugs turns it red.
+The suite is verified by mutation: reintroducing each of those bugs turns it red —
+including the later ones, where deleting `judge.run`'s `return` fails seven tests and
+merging two ads that state different floors fails two.
 
 `fetch.py` also refuses to start a run it cannot finish. A missing `playwright` or an
 uninstalled chromium aborts with the fix command; a missing Tesseract only warns, but

@@ -572,19 +572,115 @@ def commit(cfg, stage1_path, verdicts_path=None, update=False):
             print("   ! " + f)
 
 
+DEAD_STATUSES = ("REJECTED", "DISMISSED", "GONE")
+
+
+def is_live(listing: dict) -> bool:
+    return str(listing.get("status", "")).upper() not in DEAD_STATUSES
+
+
+def tally(rows: list, field: str) -> dict:
+    out: dict = {}
+    for l in rows:
+        key = l.get(field) or "(blank)"
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
+def _counts(tallied: dict) -> str:
+    return "  ".join("%s=%d" % kv for kv in
+                     sorted(tallied.items(), key=lambda x: str(x[0])))
+
+
+def snapshot(cfg) -> dict:
+    """The counts as they stand right now.
+
+    Taken before a run so the report afterwards can say what THIS run changed.
+    Without it every number is a running total, and "22 disqualified by their
+    detail page" cannot be told from 22 that were already there - which is
+    exactly the question left open after the 2026-09-20 run.
+    """
+    state = load_state(cfg)
+    listings = state.get("listings", [])
+    live = [l for l in listings if is_live(l)]
+    dead = [l for l in listings if not is_live(l)]
+    return {
+        "taken_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "tracked": len(listings),
+        "live": len(live),
+        "ruled_out": len(dead),
+        "aircon_live": tally(live, "aircon"),
+        "unreported": sum(1 for l in live if not l.get("reported_on")),
+    }
+
+
+def write_baseline(cfg) -> dict:
+    snap = snapshot(cfg)
+    write_json(cfg.runs_dir / "baseline.json", snap)
+    return snap
+
+
+def read_baseline(cfg) -> dict | None:
+    path = cfg.runs_dir / "baseline.json"
+    if not path.exists():
+        return None
+    try:
+        return read_json(path)
+    except (ValueError, OSError):
+        return None
+
+
+def _delta(label: str, before, after) -> str | None:
+    diff = (after or 0) - (before or 0)
+    if not diff:
+        return None
+    return "%+d %s" % (diff, label)
+
+
 def report(cfg):
     state = load_state(cfg)
     listings = state["listings"]
-    live = [l for l in listings
-            if str(l.get("status", "")).upper() not in ("REJECTED", "DISMISSED", "GONE")]
+    live = [l for l in listings if is_live(l)]
+    dead = [l for l in listings if not is_live(l)]
     print("tracked %d  |  live %d  ·  ruled out %d"
-          % (len(listings), len(live), len(listings) - len(live)))
-    for field in ("priority", "status", "aircon"):
-        tally = {}
-        for l in listings:
-            key = l.get(field) or "(blank)"
-            tally[key] = tally.get(key, 0) + 1
-        print("  %-9s %s" % (field, "  ".join("%s=%d" % kv for kv in sorted(tally.items(), key=lambda x: str(x[0])))))
+          % (len(listings), len(live), len(dead)))
+
+    base = read_baseline(cfg)
+    if base:
+        parts = [p for p in (
+            _delta("tracked", base.get("tracked"), len(listings)),
+            _delta("live", base.get("live"), len(live)),
+            _delta("ruled out", base.get("ruled_out"), len(dead)),
+            _delta("A/C in unit", (base.get("aircon_live") or {}).get("yes"),
+                   tally(live, "aircon").get("yes")),
+            _delta("awaiting a daily file", base.get("unreported"),
+                   sum(1 for l in live if not l.get("reported_on"))),
+        ) if p]
+        print("  since %s: %s" % (str(base.get("taken_at", ""))[:16].replace("T", " "),
+                                  ", ".join(parts) or "nothing changed"))
+
+    # Split live from ruled-out. A single combined tally is what made the
+    # 2026-09-20 run's "aircon unchecked=58" unreadable: every one of those
+    # belonged to a listing the hard filter had already thrown out before its
+    # detail page was ever fetched, but the line could not say so, and the
+    # reason had to be dug out of state.json by hand.
+    for field in ("priority", "aircon"):
+        if live:
+            print("  %-9s live      %s" % (field, _counts(tally(live, field))))
+        if dead:
+            print("  %-9s ruled out %s" % (field if not live else "",
+                                           _counts(tally(dead, field))))
+    if listings:
+        print("  %-9s %s" % ("status", _counts(tally(listings, "status"))))
+
+    unchecked_live = tally(live, "aircon").get("unchecked", 0)
+    unchecked_dead = tally(dead, "aircon").get("unchecked", 0)
+    if unchecked_live:
+        print("  %d live listing(s) have an unread detail page - A/C still unknown"
+              % unchecked_live)
+    elif unchecked_dead:
+        print("  every unchecked A/C verdict (%d) belongs to a listing already ruled "
+              "out - nothing to fetch" % unchecked_dead)
     unseen = sum(1 for l in live if not l.get("reported_on"))
     if unseen:
         print("  %d live listing(s) not yet written to a daily file" % unseen)

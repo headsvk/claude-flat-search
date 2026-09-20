@@ -52,6 +52,11 @@ The four portals run concurrently, one page at a time within each, so wall clock
 the slowest portal — budget an hour. Background it rather than polling in a sleep
 loop.
 
+**The background-task notification is the whole wait.** It fires on its own; nothing
+else needs arranging. Do not also set a `/loop` wake-up as a safety net — that is for
+self-paced loops, and on a scheduled run it just fires again after the digest has
+already been delivered.
+
 `flat-search` runs a dependency preflight and will not start a run it cannot finish.
 A missing `playwright`, or a chromium that was never installed, aborts with the fix
 command. A missing Tesseract does NOT abort — it warns that floorplan OCR is off.
@@ -127,16 +132,33 @@ text means `unstated`, written straight to verdicts.json. It prints:
 
 If n is 0, the verdicts file is complete; go to step 5.
 
+**`flat-search run` stops here by itself when n > 0** — it prints the banner and
+returns without committing or rendering, because a listing committed `unchecked` is
+stamped into a daily file it only ever gets one of, and the judged version can then
+never be shown. That refusal was dead code for a while: `judge` returned None instead
+of a count, and the run of 2026-09-20 committed 43 unjudged listings and looked
+healthy doing it. If `run` reaches commit while the judge printed a non-zero
+NEEDS JUDGEMENT, stop and treat it as a bug, not a quiet morning.
+
 If n > 0, hand `needs_review.json` to a **cheap model in a subagent** — Haiku is
 enough and this is the only step that needs a model at all. Validated on 32 flagged
 listings: it matched hand judgement 32/32 with every quote verbatim. Do not do this
 judging in the main session, and do not shell out to a CLI.
 
-The judge step re-flags EVERY cached listing that mentions cooling, not only today's, so
-most entries on most mornings were judged on an earlier run. Diff the flagged URLs
-against the previous `data/runs/verdicts_haiku.json` and send only the new ones.
+`needs_review.json` now holds only the genuinely new ones. The step scans the whole
+cache, so a listing that mentions cooling is a candidate every morning for as long as
+it is tracked — 2026-09-20: 43 flagged, 4 new — but it diffs them against
+`verdicts_haiku.json` itself and reports what it carried:
 
-`needs_review.json` is `{"needs_model_judgement": [{url, terms, cache_file, text}]}`,
+    already judged    : 39  (verdict carried forward, page unchanged)
+
+Do not diff by hand. If the counts look wrong, read them; do not re-derive them.
+
+A carried verdict is keyed to a fingerprint of the page it was read off, so a
+rewritten description re-flags the listing, marked `[re-judge]`, instead of quietly
+collapsing to `unstated` at commit. Those need judging like any other entry.
+
+`needs_review.json` is `{"needs_model_judgement": [{url, terms, cache_file, text, text_sha, rejudge}]}`,
 where `text` is windowed to ±250 characters around each matched term rather than the
 whole page. Pass the subagent the file PATH, not the contents. Ask for, per entry:
 
@@ -156,6 +178,11 @@ claim to `unstated`.
 the two in sequence would mark everything missing from the second as unchecked.
 
     flat-search finish
+
+`finish` also stamps each model verdict with the fingerprint of the page it was read
+off. That is what lets the next run carry it forward instead of paying for it again,
+so judge by writing `verdicts_haiku.json` and running `finish` — not by editing
+`verdicts.json` directly.
 
 Open these files with an explicit `encoding='utf-8'`; on Windows the default
 codepage raises UnicodeDecodeError on listing text.
@@ -186,10 +213,26 @@ unread one spends its single appearance on a stub with no size, floor, lift or A
 A listing held 7 days is released anyway, flagged, so a permanently failing fetch
 cannot hide it forever.
 
-`report`'s `aircon unchecked=N` is not automatically a defect. A listing rejected by
-the hard filter never gets a verdict validated, and a listing still awaiting its
-detail page is unchecked because it genuinely has not been read. Only an unchecked
-row that is NEW *and* was fetched is worth investigating.
+`report` splits every tally into live and ruled-out, and says which kind of unchecked
+it is looking at:
+
+    aircon    live      unstated=805  yes=35
+              ruled out unchecked=37  unstated=5  yes=4
+    every unchecked A/C verdict (37) belongs to a listing already ruled out - nothing to fetch
+
+Read that line; do not reason about it. A listing rejected by the hard filter never
+gets a verdict validated, so its `unchecked` is not a backlog — and on 2026-09-20 all
+37 were exactly that, while the answer given in the session was a plausible-sounding
+guess at the runbook's generic wording, corrected only after being challenged. Only
+`N live listing(s) have an unread detail page` is work.
+
+`report` also prints what changed since the run started, from a baseline snapshot
+`run` takes before it touches anything:
+
+    since 2026-09-20 14:42: +53 tracked, +22 ruled out, +21 A/C in unit
+
+Use those numbers for the digest rather than differencing totals by hand. `finish`
+reuses the same baseline, so the delta spans the whole morning.
 
 ## 7. Report
 
@@ -209,8 +252,16 @@ recorded and flagged, never treated as absence. This has regressed three times.
 
 A size read off a floorplan by OCR is marked `*` and never hard-rejects.
 
-The same flat listed on two portals appears twice; dedup is by URL. Say so when
-several of the top listings are the same property.
+Duplicate ads are collapsed for you. Rows agreeing on price, address, beds and baths,
+and contradicting each other on nothing they state, become one row carrying every
+link and marked `N near-identical ads`; the headline says `53 new (43 distinct
+flats)` when the two differ, and a section heading says `High - 174 (188 ads)`. Separate flats in one building are never collapsed —
+they are real, separate options — but are marked `N units in this building`, counted
+across the whole tracker. Quote the distinct count, not the ad count.
+
+Note what the marking does and does not claim. `near-identical ads` means the ads
+agree on everything they state, not that they are provably one flat; two ads whose
+stated floors or sizes disagree stay separate rows.
 
 If policy turned out to be wrong, edit `criteria.toml` directly and in place. Do not
 append dated notes to it and do not put narrative in it.
@@ -222,6 +273,13 @@ append dated notes to it and do not put narrative in it.
 - Every fetched listing should have a non-empty cache file.
 - Zero unexplained validation downgrades at commit. A downgrade means the model
   quoted something that is not on the page.
+- The run either judged everything or stopped. Commit output appearing under a
+  non-zero `NEEDS JUDGEMENT` is a broken gate, not a fast morning.
+- **Check a claim against the data before making it.** Every count in the digest is
+  available from `flat-search report` or one grep. On 2026-09-20 a reason was given
+  for 37 unchecked listings from the shape of this file's wording rather than from
+  `state.json`, and it was wrong. If the report does not already say it, grep for it;
+  do not infer it from the runbook.
 
 ## Traps, each of which cost real time
 
