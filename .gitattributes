@@ -1,0 +1,7 @@
+# One line ending in the repository, whatever platform wrote the file.
+# Three files were committed with CRLF and the rest with LF, which makes a
+# whitespace-only change look like a rewritten file in every diff and blame.
+* text=auto eol=lf
+
+# Keep the lockfile byte-exact.
+uv.lock -text
