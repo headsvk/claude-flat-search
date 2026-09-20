@@ -228,5 +228,67 @@ class TestShippedExample(unittest.TestCase):
         self.assertEqual(fetch.config_url_drift(self.cfg), [])
 
 
+class TestMoveInDate(unittest.TestCase):
+    """A date the ranking cannot read has to be an error, not a shrug.
+
+    `move_in` is the one threshold whose failure is completely invisible.
+    Nothing downstream raises on an unreadable date: `base_tier` checks
+    `if move_in:` and, finding None, skips the availability comparison
+    entirely. So `move_in = "Dec 2026"` loaded fine, date-ranking silently
+    stopped happening, and a flat available six months late came back High
+    with no note saying why. `check` did not print the date either, so there
+    was nowhere the mistake could surface.
+    """
+
+    def load(self, value):
+        body = '[requirements]\nbudget_pcm = 3000\n[dates]\nmove_in = "%s"\n' % value
+        return C.load(write_config(tempfile.mkdtemp(), body))
+
+    def test_iso_is_accepted(self):
+        self.assertEqual(self.load("2026-12-01").move_in, "2026-12-01")
+
+    def test_readable_spellings_are_normalised_to_iso(self):
+        """Stored one way, so nothing downstream has to re-parse a variant."""
+        for written in ("1 December 2026", "1 Dec 2026", "01/12/2026"):
+            with self.subTest(written=written):
+                self.assertEqual(self.load(written).move_in, "2026-12-01")
+
+    def test_empty_means_flexible_and_stays_legal(self):
+        self.assertEqual(self.load("").move_in, "")
+
+    def test_an_unreadable_date_is_refused(self):
+        for bad in ("2026-13-01", "Dec 2026", "2026/12/01", "next March",
+                    "01-12-2026", "tomorrow"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(C.ConfigError) as caught:
+                    self.load(bad)
+                self.assertIn("move_in", str(caught.exception))
+
+    def test_validation_uses_the_parser_that_consumes_it(self):
+        """The two must never be able to disagree.
+
+        A separate validator in config would be a second definition of "a date
+        this understands", and the day it drifts from core.parse_date is the
+        day a config passes and the ranking silently ignores it again.
+        """
+        from flatsearch import core
+        for value in ("2026-12-01", "1 December 2026", "01/12/2026"):
+            with self.subTest(value=value):
+                self.assertEqual(self.load(value).move_in,
+                                 core.parse_date(value).isoformat())
+
+    def test_a_date_that_loads_actually_ranks(self):
+        """End to end: the accepted value has to reach base_tier and bite."""
+        from flatsearch import core
+        from helpers import make_config
+        late = {"postcode": "SW3 1AA", "available_from": "2027-06-01",
+                "price_pcm": 2000, "bed_count": 2, "bathrooms": 2}
+        cfg = make_config(move_in=self.load("1 December 2026").move_in,
+                          furnishing="either")
+        tier, notes = core.base_tier(late, cfg)
+        self.assertEqual(tier, 1)
+        self.assertTrue(any("after move-in window" in n for n in notes), notes)
+
+
 if __name__ == "__main__":
     unittest.main()

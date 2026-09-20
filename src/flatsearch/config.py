@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import pathlib
+import re
 import tomllib
 
 DEFAULT_CONFIG_NAME = "criteria.toml"
@@ -129,7 +130,6 @@ class Config:
         """
         if not district:
             return None
-        import re
         d = district.strip().lower()
         stem = re.match(r"^([a-z]{1,2}\d{1,2})[a-z]$", d)
         candidates = [d] + ([stem.group(1)] if stem else [])
@@ -228,13 +228,42 @@ def load(path: str | pathlib.Path | None = None) -> Config:
         raise ConfigError("[preferences] aircon must be one of %s"
                           % ", ".join(AIRCON_MODES))
 
-    for key in ("requirements.budget_pcm", "requirements.min_bedrooms",
-                "requirements.min_bathrooms", "preferences.min_sqft",
-                "run.stage2_cap"):
-        if values[key] < 0:
-            raise ConfigError("%s cannot be negative" % key.replace(".", " "))
+    # Every numeric key, not a subset of them. The list used to skip
+    # max_bedrooms, the two floor thresholds and move_in_slack_days, so a typo'd
+    # minus sign on any of those passed validation and then quietly warped the
+    # ranking - which is the exact class of silent-wrong-answer this config
+    # module exists to make impossible.
+    for section, keys in SCHEMA.items():
+        for key, (kind, _) in keys.items():
+            if kind is int and values["%s.%s" % (section, key)] < 0:
+                raise ConfigError("[%s] %s cannot be negative" % (section, key))
     if values["requirements.budget_pcm"] == 0:
         raise ConfigError("[requirements] budget_pcm must be greater than 0")
+    if values["requirements.max_bedrooms"] and (
+            values["requirements.max_bedrooms"] < values["requirements.min_bedrooms"]):
+        raise ConfigError(
+            "[requirements] max_bedrooms (%d) is below min_bedrooms (%d), so "
+            "nothing can ever match" % (values["requirements.max_bedrooms"],
+                                        values["requirements.min_bedrooms"]))
+
+    # Validated with the SAME parser that consumes it, never a second one of
+    # its own: a config that accepts a date the ranking cannot read is worse
+    # than one that rejects it. An unreadable date raises nowhere downstream -
+    # `base_tier` just skips the whole availability check - so a typo'd month
+    # silently stops date-ranking altogether, and a flat available half a year
+    # late comes back High with nothing said about it. Empty stays legal and
+    # means the timing is flexible.
+    from . import core
+    move_in = str(values["dates.move_in"]).strip()
+    if move_in:
+        parsed = core.parse_date(move_in)
+        if parsed is None:
+            raise ConfigError(
+                "[dates] move_in is not a date this can read: %r\n"
+                "Use YYYY-MM-DD, e.g. 2026-12-01. Also accepted: "
+                "'1 December 2026', '1 Dec 2026', '01/12/2026'.\n"
+                "Leave it as \"\" if your timing is flexible." % move_in)
+        move_in = parsed.isoformat()   # one spelling from here on
 
     data_dir = pathlib.Path(values["run.data_dir"]).expanduser()
     if not data_dir.is_absolute():
@@ -256,7 +285,7 @@ def load(path: str | pathlib.Path | None = None) -> Config:
         prime_districts=_districts(values["districts.prime"], "districts", "prime"),
         affluent_districts=_districts(values["districts.affluent"], "districts", "affluent"),
         fringe_districts=_districts(values["districts.fringe"], "districts", "fringe"),
-        move_in=str(values["dates.move_in"]).strip(),
+        move_in=move_in,
         move_in_slack_days=values["dates.move_in_slack_days"],
         stage2_cap=values["run.stage2_cap"],
         searches=_searches(raw.get("searches", {})),

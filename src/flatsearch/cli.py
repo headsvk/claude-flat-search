@@ -198,6 +198,18 @@ def cmd_check(args) -> int:
         len(cfg.prime_districts), len(cfg.affluent_districts),
         len(cfg.fringe_districts),
         " (others REJECTED)" if cfg.districts_only else " (others ranked low)"))
+    # Printed because it is the one threshold with no visible effect when it is
+    # wrong: nothing downstream fails on an unreadable date, the availability
+    # check is simply skipped. Loading now rejects one, so this line is here to
+    # show what was understood - and to say which portals can actually answer it.
+    if cfg.move_in:
+        print("move-in     : %s (+%d days slack)"
+              % (cfg.move_in, cfg.move_in_slack_days))
+        print("              Rightmove and OpenRent state a date; Zoopla and")
+        print("              OnTheMarket do not, so theirs stay 'availability")
+        print("              unconfirmed' and are flagged, never rejected.")
+    else:
+        print("move-in     : any (no date set - timing is not ranked on)")
     print("aircon      : %s" % cfg.aircon)
     print("cap         : %d detail pages per run" % cfg.stage2_cap)
     print("searches    : %d URL(s)" % len(cfg.searches))

@@ -1,7 +1,7 @@
 # Portal behaviour, as measured
 
 Reference, not configuration. Nothing here is read by any script — the config is
-[criteria.example.md](criteria.example.md).
+[examples/criteria.example.toml](../examples/criteria.example.toml).
 
 Everything below was established by running searches and counting results. **None of
 it was taken from a portal's filter UI**, because several of these do not do what
@@ -41,6 +41,25 @@ the order is relevance rather than recency.
 
 OnTheMarket interleaves promoted listings, so its early stop needs the
 two-consecutive-stale-pages rule rather than reacting to a single page.
+
+## Availability dates
+
+Half the portals publish one. This matters when `move_in` is set, because it
+decides which listings can ever be ranked on timing at all.
+
+| Portal | availability date | where |
+|---|---|---|
+| Rightmove | yes | `letAvailableDate` in the search payload, and a "Let available date" label on the detail page |
+| OpenRent | yes | stated on both the search card and the detail page |
+| Zoopla | **no** | not published in either place |
+| OnTheMarket | **no** | not published in either place |
+
+So with a `move_in` set, every Zoopla and OnTheMarket listing carries
+`availability unconfirmed` and none is ever demoted for being too late. That is
+the intended behaviour — unknown never rejects — but it means timing does real
+filtering work on only half your results, and the other half needs the date
+checked by hand before you view. `flat-search check` prints this alongside the
+date so it is visible at setup rather than discovered later.
 
 ## Pagination
 
