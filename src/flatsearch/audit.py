@@ -5,14 +5,12 @@ A catch-up means ~660 detail fetches. Before spending that, check that every
 portal really works end to end, per portal, with evidence. Anything that reads
 FAIL or THIN here would waste a large chunk of that run.
 
-    audit.py --stage1 RUN/stage1.json
+    flat-search audit
 """
 from __future__ import annotations
 
-import argparse
 import collections
 import pathlib
-import sys
 
 from . import core
 from . import judge
@@ -30,7 +28,11 @@ def report(cfg, stage1_path) -> bool:
     stage1 = core.read_json(pathlib.Path(stage1_path))
     rows = stage1["listings"]
     cache = cfg.cache_dir
-    cached = {core.read_json(f)["url"]: core.read_json(f) for f in cache.glob("*.json")}
+    cached = {}
+    for f in cache.glob("*.json"):
+        page = core.read_json(f)
+        if page.get("url"):
+            cached[page["url"]] = page
 
     print("=" * 74)
     print("STAGE 1 - field coverage per portal (what the search page gives us)")
@@ -56,8 +58,13 @@ def report(cfg, stage1_path) -> bool:
     print("STAGE 2 - detail extraction per portal (the part a catch-up spends on)")
     print("=" * 74)
     if not cached:
-        print("  no cache yet - run fetch.py details first")
-        return
+        # READY, not a failure. Nothing has been fetched yet because nothing
+        # has been fetched yet - which is the state of every fresh clone, and
+        # exactly what the details fetch that comes next is for. Returning None
+        # here made `flat-search run` abort on its own first run with "an
+        # extractor looks broken", sending people after a bug that is not there.
+        print("  no cache yet - nothing to certify; the details fetch comes next")
+        return True
     seen = collections.defaultdict(lambda: {"n": 0, "chars": [], "thin": 0,
                                             "desc": 0, "amen": 0})
     # Resolve a cached page's portal from everything we have ever tracked, not
@@ -119,7 +126,3 @@ def report(cfg, stage1_path) -> bool:
                            "NOT READY - fix the above first"))
     print("=" * 74)
     return ready
-
-
-if __name__ == "__main__":
-    main()

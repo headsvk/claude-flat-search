@@ -191,8 +191,24 @@ codepage raises UnicodeDecodeError on listing text.
 
     flat-search commit
 
-Add `--update` when you used `--refresh`. Commit updates records in place and
-never touches `status`, `found_on` or `reported_on`.
+Add `--refresh` when you used `--refresh` on the details fetch. Commit updates
+records in place and never touches `status`, `found_on` or `reported_on`.
+
+The flag decides what happens to a listing already tracked, and the difference
+matters on any morning that does not re-read every page:
+
+  - **without it, commit merges.** Fresh values are written, but a field this
+    run learned nothing about keeps what is already on the record. A listing
+    whose detail page was not re-fetched has no verdict this morning, and
+    `unchecked` is the absence of a reading, not a finding — writing it over a
+    confirmed `yes` would erase the quote backing it, and an erased verdict
+    looks exactly like a listing nobody has read yet.
+  - **with it, commit rewrites in full**, including clearing a field the
+    listing no longer states. That is what you want after deliberately
+    re-reading the pages, and only then.
+
+A re-read that finds nothing still wins: `unstated` means the page was read and
+is silent, so it clears a previous `yes` either way.
 
 Carry its flags into the report — a quote that did not match the page, a listing that
 failed the hard filter only once its detail page was read. Its "DISQUALIFIED BY THEIR
@@ -295,7 +311,7 @@ append dated notes to it and do not put narrative in it.
   a finding.
 - **Some portals quote rent per week.** `£1,000 pw` is £4,333 pcm. Always convert.
 - **Verify portal parameters by testing, never from the filter UI.** Several accept a
-  filter and ignore it. See PORTALS.md.
+  filter and ignore it. See [portals.md](portals.md).
 - **Shell heredocs can eat a backslash level.** Write patch scripts to a file using
   raw strings rather than piping a heredoc when the content has escapes, and test the
   behaviour, not just that the file parses.

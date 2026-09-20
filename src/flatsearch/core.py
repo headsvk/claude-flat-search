@@ -13,13 +13,11 @@ Subcommands:
 """
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import hashlib
 import json
 import pathlib
 import re
-import sys
 
 
 AIRCON_VERDICTS = {"yes", "likely", "no", "unstated"}
@@ -268,7 +266,11 @@ def apply_aircon(tier: int, aircon: dict, cfg: dict) -> tuple[int, list[str]]:
     if verdict in ("yes", "likely") and scope == "communal_only":
         notes.append("A/C is communal only, not in the unit")
 
-    if mode == "ignore":
+    # The spelling has to match config.AIRCON_MODES exactly. It did not: this
+    # read "ignore" while the only value the config accepts is "ignored", so
+    # the mode was unreachable and silently behaved as "preferred" - an in-unit
+    # hit still promoted a tier for someone who had asked for A/C to be ignored.
+    if mode == "ignored":
         return tier, notes
     if mode == "required":
         # "unchecked" means we never opened the page - that is not evidence of
@@ -410,7 +412,8 @@ def plan(cfg, stage1_path, out_path, cap=None, refresh=False):
     print("already tracked     : " + str(len(dupes)) + " (skipped)")
     if refresh:
         print("re-queued (refresh) : " + str(len(refreshed)) +
-              " already-tracked listing(s) - commit needs --update to write them back")
+              " already-tracked listing(s) - commit --refresh rewrites them in "
+              "full; without it the fresh values merge and nothing is blanked")
     print("hard-filtered out   : " + str(len(rejected)))
     for r in rejected[:8]:
         print("   - " + r["reason"] + ": " + str(r["title"] or r["url"])[:60])
@@ -446,8 +449,63 @@ DERIVED = ("title", "platform", "area", "postcode", "price_pcm", "bills_included
            "aircon", "aircon_scope", "aircon_evidence", "aircon_checked",
            "notes", "priority")
 
+# The four A/C fields are one fact in four columns and must always be written
+# together, from whichever verdict won. Merging them field by field produced a
+# record reading `unstated` while still carrying the quote from the `yes` it
+# replaced - a contradiction that no report would ever surface. `carry_verdict`
+# already decides this group as a whole, so the per-field guard below skips it.
+AIRCON_FIELDS = ("aircon", "aircon_scope", "aircon_evidence", "aircon_checked")
+
+# Values that mean "this run learned nothing", as opposed to a fact. `unstated`
+# is a finding - the page was read and says nothing about cooling - and must
+# overwrite. `unchecked` is the absence of a reading and must not.
+NO_INFORMATION = (None, "", "Unknown", "unchecked")
+
+
+def uninformative(value) -> bool:
+    return value in NO_INFORMATION or (isinstance(value, str) and not value.strip())
+
+
+def carry_verdict(ac: dict, existing: dict | None) -> dict:
+    """Keep a stored A/C verdict when this run has nothing to say about it.
+
+    `commit` walks stage 1, not the fetch queue, so a listing tracked weeks ago
+    is re-committed every morning it is still advertised - but only listings in
+    the queue get a verdict. With no cache entry `validate_verdict` returns
+    `unchecked`, and writing that over a stored verdict destroyed the quote the
+    whole validation gate exists to protect: a listing confirmed `yes` with
+    evidence came back `unchecked` with none, and being unchecked is invisible.
+
+    Carrying it forward keeps the verdict AND its evidence, and - because this
+    runs before tiering - keeps `priority` and `notes` consistent with it.
+    """
+    if not existing or ac.get("verdict") != "unchecked":
+        return ac
+    stored = str(existing.get("aircon") or "")
+    if uninformative(stored) or stored not in AIRCON_VERDICTS:
+        return ac
+    return {"verdict": stored,
+            "scope": existing.get("aircon_scope") or "",
+            "evidence": existing.get("aircon_evidence") or "",
+            "checked": existing.get("aircon_checked") or "",
+            "flags": []}
+
 
 def commit(cfg, stage1_path, verdicts_path=None, update=False):
+    """Write stage-1 listings into state.json.
+
+    `update` (the `--refresh` flag) decides what happens to a listing already
+    tracked. It used to be accepted and never read, so both paths did the same
+    thing - the destructive one:
+
+      update=False  merge. Fresh values are written, but a field this run knows
+                    nothing about keeps what is already on the record. This is
+                    the normal morning run, where most tracked listings were
+                    never re-fetched and there is nothing new to say about them.
+      update=True   authoritative rewrite. You deliberately re-fetched these
+                    pages, so the new read wins outright, including clearing a
+                    field the listing no longer states.
+    """
     stage1 = read_json(pathlib.Path(stage1_path))
     listings = stage1.get("listings", stage1 if isinstance(stage1, list) else [])
     verdicts = {}
@@ -496,6 +554,8 @@ def commit(cfg, stage1_path, verdicts_path=None, update=False):
             continue
 
         ac = validate_verdict(url, verdicts.get(url), cache_dir)
+        if not update:
+            ac = carry_verdict(ac, existing)
         for f in ac["flags"]:
             flags.append(str(listing.get("title") or url)[:48] + ": " + f)
         ac_counts[ac["verdict"]] = ac_counts.get(ac["verdict"], 0) + 1
@@ -541,7 +601,14 @@ def commit(cfg, stage1_path, verdicts_path=None, update=False):
 
         if existing:
             for key in DERIVED:
-                existing[key] = record.get(key)
+                value = record.get(key)
+                # A blank from a run that never read this listing is not a
+                # correction, and must not erase what an earlier run measured.
+                if not update and key not in AIRCON_FIELDS \
+                        and uninformative(value) \
+                        and not uninformative(existing.get(key)):
+                    continue
+                existing[key] = value
             existing["last_seen"] = run_date
             updated += 1
         else:

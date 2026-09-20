@@ -401,9 +401,11 @@ def run(cfg, day: str | None = None) -> None:
     for l in fresh:
         l["reported_on"] = day
     if fresh:
-        state["updated"] = dt.datetime.now().isoformat(timespec="seconds")
-        state_path.write_text(json.dumps(state, indent=1, ensure_ascii=False),
-                              encoding="utf-8")
+        # Through core.save_state, not a bare write_text: this is the same
+        # 800 KB state.json, and it deserves the same temp-file-and-swap that
+        # `commit` gets. A plain write truncates it in place, so an interrupt
+        # here - between stamping and finishing - lost the whole tracker.
+        core.save_state(cfg, state)
     write_index(folder)
     print("%s: %d listed%s%s" % (
         folder / ("%s.md" % day), shown,
