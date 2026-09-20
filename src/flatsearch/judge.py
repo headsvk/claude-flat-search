@@ -20,15 +20,13 @@ The split:
 This is deliberately conservative: the pre-filter may only downgrade work to a
 human/model, never upgrade. It cannot emit `yes` on its own.
 
-    judge.py --config config.md --out RUN/verdicts.json --review RUN/needs_review.json
+    flat-search judge
 """
 from __future__ import annotations
 
-import argparse
 import hashlib
 import pathlib
 import re
-import sys
 
 from . import core
 
@@ -325,9 +323,6 @@ def run(cfg, out_path, review_path, stage1_path=None) -> int:
     print("with a verbatim quote, append them to verdicts.json, then commit.")
     return len(review)
 
-
-if __name__ == "__main__":
-    main()
 
 
 def merge_verdicts(cfg) -> int:

@@ -4,8 +4,8 @@
 One browser per portal run, cookie consent accepted before reading anything,
 jittered pacing, and a hard cache so a listing page is never fetched twice.
 
-    fetch.py search  --out RUN/stage1.json
-    fetch.py details --queue RUN/queue.json --stage1 RUN/stage1.json
+    flat-search search
+    flat-search details
 
 Two hard-won rules are encoded here:
 
@@ -22,11 +22,10 @@ Two hard-won rules are encoded here:
 A challenge page and a genuinely empty result set look identical, so an empty
 search is reported as an ERROR, never as a quiet success.
 
-Setup:  pip install playwright && python -m playwright install chromium
+Setup:  uv sync && uv run playwright install chromium
 """
 from __future__ import annotations
 
-import argparse
 import asyncio
 import pathlib
 import random
@@ -532,8 +531,8 @@ async def preflight(cfg: dict | None = None) -> None:
         from playwright.async_api import async_playwright
     except ImportError:
         sys.exit("FATAL: playwright is not installed.\n"
-                 "  pip install -r requirements.txt\n"
-                 "  python -m playwright install chromium")
+                 "  uv sync\n"
+                 "  uv run playwright install chromium")
 
     try:
         pw = await async_playwright().start()
