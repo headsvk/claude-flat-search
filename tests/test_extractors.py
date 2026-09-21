@@ -8,6 +8,7 @@ because the run looks completely healthy either way.
 
     python -m unittest discover -s tests -v
 """
+import json
 import pathlib
 import sys
 import tempfile
@@ -239,6 +240,47 @@ class TestWindows(unittest.TestCase):
 # Quote validation. This is what makes a model's A/C claim trustworthy: an
 # unbacked claim is worth less than no claim, because it looks like evidence.
 # ---------------------------------------------------------------------------
+
+class TestOtmSearchTotal(unittest.TestCase):
+    """A search extractor returns (rows, TOTAL), and `collect` stops paging once
+    it has seen `total` listings. OnTheMarket returned the length of the page
+    instead of the server's count, so 30 >= 30 ended every search after page
+    one - 30 listings out of 15519, with no error and no zero to notice.
+    """
+
+    def page(self, total, n=3):
+        props = [{"details-url": "/details/%d/" % i, "address": "%d The Road" % i}
+                 for i in range(n)]
+        body = {"props": {"initialReduxState": {"results": {
+            "list": props, "totalResults": total}}}}
+        return '<script id="__NEXT_DATA__" type="application/json">%s</script>' % (
+            json.dumps(body))
+
+    def test_the_server_count_is_the_total(self):
+        rows, total = portals.otm_search(self.page(15519, n=3), None)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(total, 15519)
+
+    def test_a_missing_count_falls_back_to_the_page(self):
+        """Better a short walk than a total of 0, which would read as a portal
+        that returned nothing."""
+        body = {"props": {"initialReduxState": {"results": {
+            "list": [{"details-url": "/details/1/"}]}}}}
+        html = ('<script id="__NEXT_DATA__" type="application/json">%s</script>'
+                % json.dumps(body))
+        rows, total = portals.otm_search(html, None)
+        self.assertEqual(total, 1)
+
+    def test_a_string_count_is_not_trusted(self):
+        """`recentlyAdded.total` in the same payload is the string "99+", so a
+        non-integer here is a different field, not a number to page against."""
+        body = {"props": {"initialReduxState": {"results": {
+            "list": [{"details-url": "/details/1/"}], "totalResults": "99+"}}}}
+        html = ('<script id="__NEXT_DATA__" type="application/json">%s</script>'
+                % json.dumps(body))
+        rows, total = portals.otm_search(html, None)
+        self.assertEqual(total, 1)
+
 
 class TestValidateVerdict(unittest.TestCase):
     URL = "https://www.example.com/properties/1"

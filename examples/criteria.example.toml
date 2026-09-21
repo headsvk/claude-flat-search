@@ -72,13 +72,32 @@ fringe   = ["W6", "W10", "SW4", "SE1", "E14"]
 # nothing downstream fails on a date it cannot parse, it just stops ranking on
 # availability, so a typo would quietly promote flats that are months too late.
 #
-# Only Rightmove and OpenRent publish an availability date. Zoopla and
-# OnTheMarket do not, so their listings carry "availability unconfirmed" and
-# are flagged rather than demoted - unknown never rejects. See docs/portals.md.
+# All four portals state an availability date on most listings. Rightmove,
+# Zoopla and OnTheMarket each put it in a field on the detail page; OpenRent
+# writes it into the advert text. The pipeline reads all of them, field or
+# prose. (Per-portal percentages measured on 2026-09-21 describe this cache's
+# own coverage, not the portals' - see docs/portals.md.) A listing that states
+# nothing anywhere is read as available now
+# and flagged as an assumption - it is never demoted for the silence, because
+# unknown never rejects. See docs/portals.md.
 move_in = ""                 # e.g. "2026-12-01"
 
 # How far past move_in still counts as on time.
 move_in_slack_days = 7
+
+# move_in is what listings are RANKED against. It does not change what is
+# fetched: if you have a deadline, set it in the portal's own filter panel
+# alongside the price and the bed count, and paste that URL below. Rightmove
+# (moveInByDate), OpenRent (availableBefore) and Zoopla (available_from) all
+# filter on one, and a search that carries such a filter is itself evidence -
+# what comes back reads "available by <date> (verified by search filter)"
+# rather than relying on the listing to state a date. `flat-search check`
+# prints which of your URLs carry one.
+#
+# It is a real trade and it is yours to make, per portal: measured 2026-09-20,
+# a date eight months out still returned 3744 of Rightmove's 5374 and 6139 of
+# Zoopla's 8469 - the rest are dropped for having no date the portal can check,
+# not for being late. OnTheMarket has no such filter at all.
 
 
 [run]
@@ -90,6 +109,21 @@ stage2_cap = 150
 # Everything a run writes - state, cache, daily files, logs - lives here.
 # Relative paths resolve against this file. Keeps the repo source-only.
 data_dir = "data"
+
+# Where a portal can scope a search by listing age, this is how far back the
+# FIRST run looks - there being no previous run to measure a gap from. Every
+# run after that asks for the gap since the last one plus a small margin,
+# snapped up to a window the portal actually offers, so skipping three days
+# widens the window instead of losing those days.
+#
+# This is strictly cheaper than --incremental, which can only stop early on a
+# newest-first portal and only after two nearly-stale pages: a window is
+# settled before a single page is fetched. Three portals have measured ones,
+# with different ceilings - Zoopla 30 days, Rightmove 14, OnTheMarket 7 - so a
+# long gap can scope some and not others. OpenRent has none, and is also the
+# one portal with no newest-first sort, so nothing can spare it: it walks its
+# whole result set every run. 0 turns it off everywhere and pages the lot.
+first_run_days = 14
 
 
 [searches]

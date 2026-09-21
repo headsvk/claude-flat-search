@@ -88,9 +88,29 @@ class TestLiveAndRuledOutAreSeparate(ReportCase):
 
 class TestBaselineDeltas(ReportCase):
 
-    def test_no_baseline_means_no_delta_line(self):
+    def test_no_baseline_says_so_rather_than_printing_nothing(self):
+        """Printing nothing reads as "nothing changed". It is not: it means
+        the totals have nothing to be compared against, and the digest then
+        differences them by hand - which is how the run of 2026-09-21 reported
+        18 rejections from earlier mornings as new ones."""
         self.write([listing()])
-        self.assertNotIn("since", self.report())
+        out = self.report()
+        self.assertIn("NO BASELINE", out)
+        self.assertNotIn("+1 tracked", out)
+
+    def test_a_baseline_from_another_day_is_marked_stale(self):
+        """It differences today against the wrong morning, and the line is
+        otherwise indistinguishable from a good one."""
+        self.write([listing()])
+        core.write_baseline(self.cfg)
+        path = self.cfg.runs_dir / "baseline.json"
+        snap = core.read_json(path)
+        snap["taken_at"] = "2026-01-01T09:00:00"
+        core.write_json(path, snap)
+        self.write([listing(), listing()])
+        out = self.report()
+        self.assertIn("STALE", out)
+        self.assertIn("+1 tracked", out)
 
     def test_the_delta_names_what_this_run_changed(self):
         self.write([listing(), listing()])
@@ -111,6 +131,26 @@ class TestBaselineDeltas(ReportCase):
         self.write([listing()])
         core.write_baseline(self.cfg)
         self.assertIn("nothing changed", self.report())
+
+    def test_filling_a_missing_baseline_does_not_move_today_s(self):
+        """`search` is also the repair command. A repair that reset the
+        baseline would make the delta cover the repair, not the morning."""
+        self.write([listing()])
+        first = core.write_baseline(self.cfg)
+        self.write([listing(), listing()])
+        kept = core.ensure_baseline(self.cfg)
+        self.assertEqual(kept["taken_at"], first["taken_at"])
+        self.assertEqual(kept["tracked"], 1)
+
+    def test_a_baseline_from_an_earlier_day_is_replaced_not_kept(self):
+        self.write([listing()])
+        core.write_baseline(self.cfg)
+        path = self.cfg.runs_dir / "baseline.json"
+        snap = core.read_json(path)
+        snap["taken_at"] = "2026-01-01T09:00:00"
+        core.write_json(path, snap)
+        self.write([listing(), listing()])
+        self.assertEqual(core.ensure_baseline(self.cfg)["tracked"], 2)
 
     def test_the_baseline_is_a_snapshot_not_a_live_read(self):
         """It has to be taken before the run, and survive the run unchanged -

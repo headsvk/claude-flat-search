@@ -127,6 +127,24 @@ def hard_filter(listing: dict, cfg: dict) -> str | None:
     if min_sqft and isinstance(size, (int, float)) and size < min_sqft:
         return f"{int(size)} sq ft (min {min_sqft})"
 
+    # A date the listing STATES, past the move-in window, is a rejection like
+    # any other stated value that breaks a rule - decided 2026-09-21,
+    # replacing a demotion to Low. It is done here rather than at the portal
+    # because a portal's own availability filter also drops every listing it
+    # cannot date - roughly a third of them - and unknown never rejects.
+    #
+    # Most listings have no date until their detail page is read, so this
+    # mostly fires at commit and shows up under "DISQUALIFIED BY THEIR DETAIL
+    # PAGE", exactly like an undersized flat.
+    if cfg.move_in:
+        move_in = parse_date(cfg.move_in)
+        avail = parse_date(listing.get("available_from"))
+        if move_in and avail:
+            latest = move_in + dt.timedelta(days=cfg.move_in_slack_days)
+            if avail > latest:
+                return "available %s, after %s" % (avail.isoformat(),
+                                                   latest.isoformat())
+
     # Lower ground / basement is an outright no.
     if str(listing.get("floor_level", "")).strip().lower() in ("lower_ground", "basement"):
         return "lower ground / basement"
@@ -165,12 +183,19 @@ def base_tier(listing: dict, cfg: dict) -> tuple[int, list[str]]:
     if move_in:
         avail = parse_date(listing.get("available_from"))
         if avail:
-            slack = cfg.move_in_slack_days
-            if avail > move_in + dt.timedelta(days=slack):
-                tier = min(2, tier + 1)
-                notes.append(f"available {avail.isoformat()}, after move-in window")
+            # Anything past the window was rejected by hard_filter before this
+            # ran, so a date here is one that fits. Say it, so the digest can
+            # show timing without anyone going back to the listing.
+            notes.append("available %s" % avail.isoformat())
         else:
-            notes.append("availability unconfirmed")
+            # Decided 2026-09-21: a listing that states no date anywhere
+            # is read as available now rather than left hanging. It costs
+            # nothing in ranking - an unknown was never demoted either, because
+            # unknown never rejects - so what this changes is that the digest
+            # says which it is. The assumption is written into the note rather
+            # than into `available_from`, so a record still cannot claim a
+            # reading that never happened.
+            notes.append("availability not stated (assumed available now)")
     # No MOVE_IN_DATE set means timing is flexible - say nothing about dates.
 
     if cfg.min_bathrooms and listing.get("bathrooms") is None:
@@ -491,6 +516,64 @@ def carry_verdict(ac: dict, existing: dict | None) -> dict:
             "flags": []}
 
 
+UNJUDGED = """NOT COMMITTING - %d listing(s) a model was asked to read are still unread.
+%s
+They are in %s. Judge them with a Haiku subagent (in_unit vs communal_only,
+with a VERBATIM quote) into verdicts_haiku.json, then `flat-search finish`,
+which merges both files and commits.
+
+A listing committed now is written `unchecked` into today's daily file, and
+each listing gets exactly one."""
+
+
+class Abort(Exception):
+    """A refusal the user needs to read, not a traceback."""
+
+
+def gate_unjudged(cfg, verdicts_path) -> None:
+    """Refuse to commit while a listing a model was asked to read is unread.
+
+    This refusal used to live in `flat-search run` alone, which is the one
+    path that cannot reach commit without passing it. `flat-search commit`
+    had no gate at all, and the morning of 2026-09-21 was driven stage by
+    stage - correctly, as it happened, but nothing was enforcing it.
+
+    What it costs to be wrong is not symmetric. An uncommitted listing waits;
+    a listing committed `unchecked` is stamped into a daily file it only ever
+    gets one of, and the judged version can never be shown.
+
+    `judge` rewrites needs_review.json every time it runs, so a leftover file
+    means judgement was skipped entirely, and that refuses too.
+    """
+    review_path = cfg.runs_dir / "needs_review.json"
+    if not review_path.exists():
+        return
+    try:
+        review = read_json(review_path).get("needs_model_judgement", [])
+    except (ValueError, OSError):
+        return
+    pending = [str(e.get("url", "")).strip() for e in review if e.get("url")]
+    if not pending:
+        return
+
+    judged = set()
+    path = pathlib.Path(verdicts_path) if verdicts_path else None
+    if path and path.exists():
+        raw = read_json(path)
+        for v in raw.get("verdicts", raw if isinstance(raw, list) else []):
+            url = str(v.get("url", "")).strip()
+            if url:
+                judged.add(url)
+    missing = [u for u in pending if u not in judged]
+    if not missing:
+        return
+
+    listed = "".join("  %s\n" % u for u in missing[:5])
+    if len(missing) > 5:
+        listed += "  ... and %d more\n" % (len(missing) - 5)
+    raise Abort(UNJUDGED % (len(missing), listed, review_path))
+
+
 def commit(cfg, stage1_path, verdicts_path=None, update=False):
     """Write stage-1 listings into state.json.
 
@@ -506,6 +589,7 @@ def commit(cfg, stage1_path, verdicts_path=None, update=False):
                     pages, so the new read wins outright, including clearing a
                     field the listing no longer states.
     """
+    gate_unjudged(cfg, verdicts_path)
     stage1 = read_json(pathlib.Path(stage1_path))
     listings = stage1.get("listings", stage1 if isinstance(stage1, list) else [])
     verdicts = {}
@@ -687,6 +771,19 @@ def write_baseline(cfg) -> dict:
     return snap
 
 
+def ensure_baseline(cfg) -> dict:
+    """Fill in a missing baseline without moving one already taken today.
+
+    `search` is also how a partly failed morning is repaired - one portal
+    re-run with `--host` - and a repair must not reset where the morning
+    started, or the delta covers the repair instead of the run.
+    """
+    base = read_baseline(cfg)
+    if base and str(base.get("taken_at", ""))[:10] == dt.date.today().isoformat():
+        return base
+    return write_baseline(cfg)
+
+
 def read_baseline(cfg) -> dict | None:
     path = cfg.runs_dir / "baseline.json"
     if not path.exists():
@@ -723,8 +820,25 @@ def report(cfg):
             _delta("awaiting a daily file", base.get("unreported"),
                    sum(1 for l in live if not l.get("reported_on"))),
         ) if p]
-        print("  since %s: %s" % (str(base.get("taken_at", ""))[:16].replace("T", " "),
-                                  ", ".join(parts) or "nothing changed"))
+        taken = str(base.get("taken_at", ""))
+        # A baseline left over from an earlier day differences today's totals
+        # against the wrong morning, and the line reads exactly like a good
+        # one. Say which morning it is measuring from.
+        stale = taken[:10] != dt.date.today().isoformat()
+        print("  since %s%s: %s"
+              % (taken[:16].replace("T", " "),
+                 "  (STALE - that baseline is not from today)" if stale else "",
+                 ", ".join(parts) or "nothing changed"))
+    else:
+        # Silence here reads as "nothing changed", and it is not: it means the
+        # totals below are running totals with nothing to compare them to. The
+        # digest that follows will otherwise difference them by hand, which is
+        # how 2026-09-21 reported 18 old rejections as new ones.
+        print("  since: NO BASELINE for this run - every count below is a "
+              "running total.")
+        print("         Do not difference them by hand. Start the morning with "
+              "`flat-search run`,")
+        print("         or `flat-search search`, either of which takes one.")
 
     # Split live from ruled-out. A single combined tally is what made the
     # 2026-09-20 run's "aircon unchecked=58" unreadable: every one of those

@@ -68,6 +68,33 @@ Preflight also warns when a search URL is TIGHTER than the config — `maxPrice=
 in a URL while `budget_pcm = 5000`, say. That silently never fetches the band you
 just opened up. Fix the URL.
 
+The search prints the window it asked each portal for, before the per-portal lines:
+
+    window zoopla.co.uk     added=3_days (0 days since the last run)
+    window rightmove.co.uk  maxDaysSinceAdded=3 (0 days since the last run)
+    window onthemarket.com  recently-added=3-days (0 days since the last run)
+
+That is the gap since the last committed run plus a margin, and it is why a daily
+search reads a few hundred results per portal rather than 8469, 5374 and 15519.
+OpenRent has no such filter and is never in this list. Three of these lines are
+worth reacting to:
+
+  - `not scoped` means the gap is wider than any window that portal offers, so this
+    run pages its whole backlog. Expect it to be slow and to find a lot. It is the
+    correct behaviour after time away, not a fault. The ceilings differ — 30 days
+    on Zoopla, 14 on Rightmove, 7 on OnTheMarket — so seeing it on one portal and
+    not another is normal.
+  - A `window` line missing for a portal that had one yesterday means the gap grew
+    past its ceiling. Same thing, worth noticing.
+  - **No availability filter is ever asked of a portal**, and none should be in
+    a search URL. `move_in` is filtered here instead, against the date each
+    listing states: a stated date past the window is a rejection like an
+    undersized flat, and a listing that states nothing is kept. A portal's own
+    filter would instead drop everything it cannot date — about a third of its
+    inventory — before this ever saw it. If a URL still carries `moveInByDate=`,
+    `available_from=` or `availableBefore=`, `flat-search check` warns; take it
+    out, or the morning's counts will be a third short with nothing to show it.
+
 **CRITICAL — the single most important rule here.** A challenged search and a
 genuinely quiet morning look IDENTICAL: both produce few or no listings. `search`
 exits NON-ZERO and prints a `PROBLEMS` block when a portal errored or returned an
@@ -243,12 +270,19 @@ guess at the runbook's generic wording, corrected only after being challenged. O
 `N live listing(s) have an unread detail page` is work.
 
 `report` also prints what changed since the run started, from a baseline snapshot
-`run` takes before it touches anything:
+taken before anything is touched — by `run`, and by `search` when a repair or a
+hand-driven stage is where the morning started:
 
     since 2026-09-20 14:42: +53 tracked, +22 ruled out, +21 A/C in unit
 
 Use those numbers for the digest rather than differencing totals by hand. `finish`
 reuses the same baseline, so the delta spans the whole morning.
+
+Where that line would be, `report` prints `since: NO BASELINE for this run` when
+there is none. That is not "nothing changed" — it means nothing recorded where the
+morning started, so there is nothing the totals can honestly be differenced
+against. Do not work the deltas out yourself; say the delta is unavailable. A
+baseline from an earlier day prints `STALE`, and means the same.
 
 ## 7. Report
 
@@ -267,6 +301,23 @@ Flag, never hide: no stated size, no stated bathroom count, an unchecked A/C ver
 recorded and flagged, never treated as absence. This has regressed three times.
 
 A size read off a floorplan by OCR is marked `*` and never hard-rejects.
+
+**A bathroom count the row does not state stays unstated in the digest.** A `2/?`
+row written up as "2/2" invents the second bathroom, on the one hard requirement
+nobody can re-check from the digest afterwards. Same for a missing size or floor.
+
+**Three counts have each been got wrong by reading the right line carelessly, all
+three in the digest of 2026-09-21:**
+
+  - **`tracked` is not `live`.** The line says `tracked 955 | live 909 | ruled out
+    46`; the digest said "955 live". Quote the field you mean.
+  - **Lead with the distinct-flat count.** The daily file's own headline says
+    `69 new (55 distinct flats)`; the digest led with 69. The ad count is always
+    the bigger number and never the honest one.
+  - **A disqualification is new only if `ruled out` moved.** It was 46 before and
+    46 after, and the digest still called 18 of them newly disqualified, because
+    `finish` re-prints that list in full every run. The count is what tells you;
+    the list never does.
 
 Duplicate ads are collapsed for you. Rows agreeing on price, address, beds and baths,
 and contradicting each other on nothing they state, become one row carrying every

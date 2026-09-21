@@ -30,6 +30,7 @@ DEFAULTS = dict(
     move_in="",
     move_in_slack_days=7,
     stage2_cap=150,
+    first_run_days=14,
     searches=(),
 )
 

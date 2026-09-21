@@ -14,6 +14,7 @@ OnTheMarket is the exception: min-bathrooms is accepted and silently ignored
 """
 from __future__ import annotations
 
+import datetime as dt
 import html as htmllib
 import json
 import re
@@ -282,6 +283,64 @@ async def zoopla_search(html: str, page):
     return out, total or len(out)
 
 
+# Both portals render the availability date and the furnishing as a FACT LABEL
+# inside their own payload rather than as a typed field - measured on live
+# pages, 2026-09-21. Neither has an `availableFrom` key of any kind; what they
+# have is:
+#
+#   Zoopla        \"tagsV2\":[{\"label\":\"Available from 8 November 2026\"},
+#                             {\"label\":\"Unfurnished\"}]        (RSC flight
+#                 payload in self.__next_f.push, so doubly escaped)
+#   OnTheMarket   "lettingDetails":{"items":["Availability date: 1 Nov 2026",
+#                                            "Furnished"]}          (__NEXT_DATA__)
+#
+# Reading these rather than the page text matters for the same reason
+# `size_from_json` exists: the containers hold facts and nothing else, so a
+# parser pointed at them cannot pick up "Underground parking available (at
+# extra cost)" or the word "unfurnished" from the middle of an advert. The page
+# text remains the fallback, because a payload shape can change overnight and a
+# silently empty extractor is this project's characteristic bug.
+#
+# NOT `startDateValues` on OnTheMarket, which looks right and is not: it is the
+# option list for the enquiry form's "when do you want to move" dropdown, the
+# same five values on every listing.
+ZOOPLA_TAGS_RE = r'\\?"tagsV2\\?"\s*:\s*\[(.*?)\]'
+ZOOPLA_TAG_LABEL_RE = r'\\?"label\\?"\s*:\s*\\?"(.*?)\\?"'
+OTM_LETTING_RE = r'\\?"lettingDetails\\?"\s*:\s*\{\s*\\?"items\\?"\s*:\s*\[(.*?)\]'
+OTM_ITEM_RE = r'\\?"(.*?)\\?"'
+
+
+def fact_labels(html: str, block_re: str, item_re: str) -> list:
+    """The labels inside one of those containers, in order."""
+    m = re.search(block_re, html, re.I | re.S)
+    if not m:
+        return []
+    out = []
+    for raw in re.findall(item_re, m.group(1), re.S):
+        label = htmllib.unescape(raw.replace('\\"', '"').replace('\\\\', '\\')).strip()
+        if label:
+            out.append(label)
+    return out
+
+
+FURNISHING = {"furnished": "Furnished", "unfurnished": "Unfurnished",
+              "part furnished": "Part furnished", "partly furnished": "Part furnished"}
+
+
+def furnishing_from(labels) -> "str | None":
+    """Furnishing as the PORTAL states it, not as the advert mentions it.
+
+    The text fallback matches the first occurrence anywhere on the page, and an
+    advert reading "offered part unfurnished" is one of several where the tag
+    and the prose disagree. The tag is the portal's own summary field.
+    """
+    for label in labels:
+        got = FURNISHING.get(label.strip().lower())
+        if got:
+            return got
+    return None
+
+
 def zoopla_detail(html: str, text: str = ""):
     parts, info = [], {}
     feats = slice_between(text, ["About this property"],
@@ -294,13 +353,25 @@ def zoopla_detail(html: str, text: str = ""):
                           "Property descriptions and related", "Could you afford"], minlen=120)
     if desc:
         parts.append("Description: " + desc[:6000])
-    m = re.search(r"(Furnished|Unfurnished|Part furnished)", text, re.I)
-    if m:
-        info["furnished"] = m.group(1)
+    tags = fact_labels(html, ZOOPLA_TAGS_RE, ZOOPLA_TAG_LABEL_RE)
+    furnished = furnishing_from(tags)
+    if not furnished:
+        m = re.search(r"(Furnished|Unfurnished|Part furnished)", text, re.I)
+        furnished = m.group(1).capitalize() if m else None
+    if furnished:
+        info["furnished"] = furnished
     size = size_from_json(html, ZOOPLA_SIZE_RE, ZOOPLA_SIZE_RE2)
     if size:
         info["size_sqft"] = size
         parts.append("Size: %d sq ft" % size)
+    # `tagsV2` first: it holds facts only, so it cannot pick up "parking
+    # available (at extra cost)". The page text is the fallback for the day the
+    # payload changes shape - a silently empty extractor is worse than a loose
+    # one.
+    avail = availability(" | ".join(tags)) or availability(text)
+    if avail:
+        info["available_from"] = avail
+        parts.append("Availability: " + avail)
     return parts, info
 
 
@@ -313,9 +384,18 @@ def otm_search(html: str, page):
     if not m:
         return [], 0
     try:
-        lst = json.loads(m.group(1))["props"]["initialReduxState"]["results"]["list"]
+        res = json.loads(m.group(1))["props"]["initialReduxState"]["results"]
+        lst = res["list"]
     except (KeyError, TypeError, json.JSONDecodeError):
         return [], 0
+    # `totalResults` is the server's count for THIS query; `list` is one page of
+    # 30 (`currentQuery.frame-size`). Returning the page length as the total
+    # made `collect` stop after page one every single time - len(seen) >= total
+    # is 30 >= 30 - so this portal had been reading 30 of 15519 since it was
+    # written, and looked healthy doing it: 56 listings a morning is low, not
+    # zero, and only zero was being watched for.
+    total = res.get("totalResults")
+    total = total if isinstance(total, int) else 0
     out = []
     for p in lst:
         url = p.get("details-url") or ""
@@ -329,7 +409,7 @@ def otm_search(html: str, page):
                          contact=((p.get("agent") or {}).get("name")
                                   if isinstance(p.get("agent"), dict) else None),
                          notes=" / ".join(p.get("features") or [])[:200] or None))
-    return out, len(out)
+    return out, total or len(out)
 
 
 def otm_detail(html: str, text: str = ""):
@@ -340,12 +420,20 @@ def otm_detail(html: str, text: str = ""):
                          minlen=60)
     if body:
         parts.append("Description: " + body[:6000])
-    lett = slice_between(text, ["Letting details"], ["Features and description"], minlen=4)
+    # `lettingDetails.items` is the portal's own fact list - ["Availability
+    # date: 1 Nov 2026", "Furnished"] - and holds nothing else. The text slice
+    # is the fallback for the day the payload changes shape.
+    items = fact_labels(html, OTM_LETTING_RE, OTM_ITEM_RE)
+    lett = " | ".join(items) or slice_between(
+        text, ["Letting details"], ["Features and description"], minlen=4)
     if lett:
         parts.append("Letting details: " + lett)
-        m = re.search(r"(Furnished|Unfurnished|Part furnished)", lett, re.I)
-        if m:
-            info["furnished"] = m.group(1)
+    furnished = furnishing_from(items)
+    if not furnished:
+        m = re.search(r"\b(Furnished|Unfurnished|Part furnished)\b", lett or "", re.I)
+        furnished = m.group(1).capitalize() if m else None
+    if furnished:
+        info["furnished"] = furnished
     # OnTheMarket publishes no size on its search cards - measured 0% coverage -
     # but the detail page carries it in JSON. Without this the 800 sq ft floor
     # never applied to this portal at all.
@@ -353,6 +441,12 @@ def otm_detail(html: str, text: str = ""):
     if size:
         info["size_sqft"] = size
         parts.append("Size: %d sq ft" % size)
+    # "Letting details: Availability date: 23 Sep 2026" is the labelled one and
+    # wins; the description's prose is the fallback for the listings without it.
+    avail = availability(lett or "") or availability(text)
+    if avail:
+        info["available_from"] = avail
+        parts.append("Availability: " + avail)
     return parts, info
 
 
@@ -386,7 +480,7 @@ async def openrent_search(html: str, page):
         beds = re.search(r"(\d+)\s+Bed", t)
         addr = re.search(r"\d+\s+Bed\s+[A-Za-z ]+,\s*([^|]+)", t)
         furn = re.search(r"\b(Unfurnished|Furnished|Part furnished)\b", t, re.I)
-        avail = re.search(r"Available\s+([A-Za-z0-9 ]{3,20})", t)
+        avail_card = availability(t)
         title = re.search(r"(\d+\s+Bed\s+[^|]+)", t)
         out.append(blank(url, (title.group(1) if title else t)[:120], "OpenRent",
                          area=(addr.group(1).strip() if addr else None),
@@ -394,7 +488,7 @@ async def openrent_search(html: str, page):
                          price_pcm=pcm_from_text(t),
                          bed_count=int(beds.group(1)) if beds else None,
                          furnished=(furn.group(1) if furn else None),
-                         available_from=(avail.group(1).strip() if avail else None),
+                         available_from=avail_card,
                          size_sqft=sqft(t)))
         out[-1]["bathrooms_verified_by_search"] = True
     return out, len(out)
@@ -416,14 +510,210 @@ def openrent_detail(html: str, text: str = ""):
     m = re.search(r"Rent PCM\s*£?([\d,]+)", text, re.I)
     if m:
         info["price_pcm"] = int(m.group(1).replace(",", ""))
-    m = re.search(r"Available From\s*([A-Za-z0-9 /]{3,20})", text, re.I)
-    if m:
-        info["available_from"] = m.group(1).strip()
+    # This used to be its own regex over a 20-character window, which captured
+    # "to move in", "Today" and "to move in from 31 A" - 106 records carrying a
+    # value that looked like data and that parse_date read as nothing at all.
+    avail = availability(text)
+    if avail:
+        info["available_from"] = avail
     if re.search(r"offered unfurnished|unfurnished", text, re.I):
         info["furnished"] = "Unfurnished"
-    elif re.search(r"furnished", text, re.I):
+    elif re.search(r"\bfurnished\b", text, re.I):
         info["furnished"] = "Furnished"
     return parts, info
+
+
+# --------------------------------------------------------------------------
+# availability
+# --------------------------------------------------------------------------
+# docs/portals.md said Zoopla and OnTheMarket publish no availability date, so
+# neither extractor looked for one and every listing on both carried
+# "availability unconfirmed": 0 of 93 Zoopla and 0 of 74 OnTheMarket records
+# held a date. Measured against the cache on 2026-09-21, the pages say
+# otherwise - 32 of 96 cached Zoopla pages and 64 of 79 OnTheMarket ones state
+# availability somewhere in their text. What is true is narrower: neither
+# portal puts it in a FIELD. OnTheMarket labels it inside "Letting details",
+# Zoopla writes it into the agent's prose, and a parser has to read English.
+#
+# Shapes measured across those pages:
+#
+#   Availability date: 23 Sep 2026          OnTheMarket, labelled
+#   Letting details: Available now          OnTheMarket, labelled
+#   Available to move in from 15 October 2026   Zoopla, OpenRent, OnTheMarket
+#   Available from 28 October, 2026         a comma before the year
+#   available from 27th October             an ordinal, and NO year
+#   Available to move in from November 2026  a month, and no day
+#   Available now / Available immediately    every portal
+#   Let available date: 26/09/2026 | Now | Ask agent    Rightmove
+#
+# Only a value that PARSES is returned, so the many near-misses in listing
+# prose - "Underground parking available (at extra cost)", "phone bookings
+# available 9am-9pm" - fall through as None rather than becoming a date.
+AVAIL_RE = re.compile(
+    r"(?:Availability date|Let available date"
+    r"|Available(?:\s+to\s+move\s+in)?(?:\s+from)?)\s*:?\s*([^.|\n]{2,40})",
+    re.I)
+
+# The label's value runs on into whatever follows it - "23 Sep 2026 Furnished",
+# "26/09/2026 Deposit" - so the date is found INSIDE the captured text rather
+# than by parsing the whole of it. Longest shapes first: "8 November 2026" must
+# not be read as the bare "November 2026" that follows it.
+DATE_IN_RE = re.compile(
+    r"(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]{3,9},?\s+20\d{2}"
+    r"|\d{1,2}/\d{1,2}/20\d{2}"
+    r"|20\d{2}-\d{2}-\d{2}"
+    r"|\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]{3,9}"
+    r"|[A-Za-z]{3,9}\s+20\d{2})", re.I)
+IMMEDIATE_RE = re.compile(r"^(?:now|immediately|immediate|today)\b", re.I)
+ORDINAL_RE = re.compile(r"(\d{1,2})(?:st|nd|rd|th)", re.I)
+
+
+def availability(text: str, today=None) -> str | None:
+    """-> ISO date this listing states it is available from, or None.
+
+    "now" and "immediately" are a stated date, not a missing one: the page was
+    read and it answered. That is the distinction the whole pipeline turns on
+    everywhere else, and availability is no different.
+    """
+    today = today or dt.date.today()
+    for m in AVAIL_RE.finditer(text or ""):
+        got = _one_date(m.group(1).strip(), today)
+        if got:
+            return got.isoformat()
+    return None
+
+
+def availability_value(value, today=None) -> str | None:
+    """Normalise ONE already-isolated label value -> ISO date, or None.
+
+    For a portal that hands over the value on its own: Rightmove's "Let
+    available date", which is "26/09/2026", "Now" or "Ask agent". "Ask agent"
+    is not a date and must read as None, not as a string that looks like data
+    and parses as nothing - 106 OpenRent records held exactly that.
+    """
+    got = _one_date(str(value or "").strip(), today or dt.date.today())
+    return got.isoformat() if got else None
+
+
+def _one_date(value: str, today):
+    value = value.strip().strip("-").strip()
+    if not value:
+        return None
+    if IMMEDIATE_RE.match(value):
+        return today
+    m = DATE_IN_RE.search(value)
+    if not m:
+        return None
+    v = re.sub(r"\s+", " ", ORDINAL_RE.sub(r"\1", m.group(1)).replace(",", " ")).strip()
+    for fmt in ("%d %B %Y", "%d %b %Y", "%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(v, fmt).date()
+        except ValueError:
+            pass
+    for fmt in ("%B %Y", "%b %Y"):
+        # "available from November 2026" - the month is the claim, so take the
+        # first of it rather than throwing the only date on the page away.
+        try:
+            return dt.datetime.strptime(v, fmt).date().replace(day=1)
+        except ValueError:
+            pass
+    # A day and a month with no year at all ("27th October"). Agents write this
+    # about the coming weeks, so read it as the next such date, not as one
+    # eleven months past.
+    # The year is supplied rather than left out: strptime on a bare day and
+    # month is deprecated in 3.14 and changes behaviour in 3.15, and "29
+    # February" then raises on the wrong year instead of rolling to the right
+    # one. This tries this year before next, and takes the first that is not
+    # already well past.
+    for fmt in ("%d %B %Y", "%d %b %Y"):
+        for year in (today.year, today.year + 1):
+            try:
+                cand = dt.datetime.strptime("%s %d" % (v, year), fmt).date()
+            except ValueError:
+                continue
+            if (today - cand).days <= 30:
+                return cand
+    return None
+
+
+# --------------------------------------------------------------------------
+# server-side windows
+# --------------------------------------------------------------------------
+# Two things a portal can narrow for us before it sends anything: how recently
+# a listing was added, and when it becomes available. Both are worth having -
+# the first because paging a backlog we already track is pure waste, the second
+# because a portal that will FILTER on availability tells us the date even when
+# it refuses to PRINT it, exactly like OpenRent's bathrooms.
+#
+# Measured 2026-09-20 on the live 2-bed / <=4500 London search, off each
+# portal's own total - Zoopla's [data-testid="total-results"], Rightmove's
+# `resultCount`, OnTheMarket's `totalResults`. Read off the counter, never the UI:
+#
+#   ZOOPLA          8469 unscoped      RIGHTMOVE       5374 unscoped
+#   added=24_hours    72               maxDaysSinceAdded=1     73
+#   added=3_days     453               maxDaysSinceAdded=3    479
+#   added=7_days    1644               maxDaysSinceAdded=7   1536
+#   added=14_days   2862               maxDaysSinceAdded=14  2565
+#   added=30_days   4360               maxDaysSinceAdded=30     0  <-- NOT a window
+#   available_from=1months   5208      moveInByDate=2026-10-01   2427
+#   available_from=3months   6111      moveInByDate=2026-11-05   3413
+#   available_from=6months   6124      moveInByDate=2027-06-01   3744
+#   available_from=12months  6139
+#
+#   ONTHEMARKET    15519 unscoped
+#   recently-added=24-hours   141
+#   recently-added=3-days    1882
+#   recently-added=7-days    4116
+#   recently-added=14-days      0     <-- NOT a window; its ceiling is 7 days
+#
+# They compose within a portal: added=3_days & available_from=1months returned
+# 242, and maxDaysSinceAdded=3 & moveInByDate=2026-11-05 returned 297 - each
+# below either of its parts alone.
+#
+# **Most of these fail CLOSED on a value they do not recognise**, which is why
+# values are only ever taken from these maps and never built from a config
+# string. `maxDaysSinceAdded=30`, `maxDaysSinceAdded=nonsense`,
+# `moveInByDate=someday`, `recently-added=14-days` and `recently-added=nonsense`
+# all returned ZERO results - so does `available_from=immediately`, which is a
+# value the Zoopla filter UI itself offers. An empty search is indistinguishable
+# from a block, so an unsupported value does not degrade, it fabricates a quiet
+# morning. Only Zoopla's `added=` is forgiving: `added=nonsense_value` returned
+# the unfiltered 8469.
+#
+# OnTheMarket has no availability filter: `available-from=` and `move-in-by=`
+# both returned the unfiltered 15519 - accepted and ignored, the same way it
+# treats `min-bathrooms`. Those are guessed spellings and the portal exposes no
+# such control, so this is "none found", not "proven absent". OpenRent is
+# UNTESTED for both, which is not the same as "no". A portal absent from these
+# tables is simply never scoped.
+
+RECENT_WINDOWS = {
+    "zoopla.co.uk": ("added", {1: "24_hours", 3: "3_days", 7: "7_days",
+                               14: "14_days", 30: "30_days"}),
+    "rightmove.co.uk": ("maxDaysSinceAdded", {1: "1", 3: "3", 7: "7", 14: "14"}),
+    "onthemarket.com": ("recently-added", {1: "24-hours", 3: "3-days", 7: "7-days"}),
+}
+
+def window_for(url: str, table: dict):
+    """-> (param, {days: value}) for this URL's portal, or None."""
+    for host, spec in table.items():
+        if host in url:
+            return spec
+    return None
+
+
+def snap_up(days: int, offered) -> int | None:
+    """Smallest offered window that still covers `days`.
+
+    Recency snaps UP: a window NARROWER than the gap since the last run stops
+    fetching listings that arrived inside it, and they are gone silently -
+    nothing downstream can tell a listing that was filtered out at the portal
+    from one that was never posted. Wider merely costs a page.
+    """
+    for d in sorted(offered):
+        if days <= d:
+            return d
+    return None
 
 
 # --------------------------------------------------------------------------

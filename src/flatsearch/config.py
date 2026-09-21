@@ -59,6 +59,7 @@ SCHEMA: dict[str, dict[str, tuple]] = {
     "run": {
         "stage2_cap": (int, 150),
         "data_dir": (str, "data"),
+        "first_run_days": (int, 14),
     },
 }
 
@@ -92,6 +93,7 @@ class Config:
     move_in_slack_days: int
 
     stage2_cap: int
+    first_run_days: int
     searches: tuple
 
     # -- derived paths. Everything a run writes lives under data_dir, so the
@@ -288,5 +290,6 @@ def load(path: str | pathlib.Path | None = None) -> Config:
         move_in=move_in,
         move_in_slack_days=values["dates.move_in_slack_days"],
         stage2_cap=values["run.stage2_cap"],
+        first_run_days=values["run.first_run_days"],
         searches=_searches(raw.get("searches", {})),
     )

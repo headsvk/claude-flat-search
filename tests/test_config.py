@@ -285,9 +285,8 @@ class TestMoveInDate(unittest.TestCase):
                 "price_pcm": 2000, "bed_count": 2, "bathrooms": 2}
         cfg = make_config(move_in=self.load("1 December 2026").move_in,
                           furnishing="either")
-        tier, notes = core.base_tier(late, cfg)
-        self.assertEqual(tier, 1)
-        self.assertTrue(any("after move-in window" in n for n in notes), notes)
+        self.assertEqual(core.hard_filter(late, cfg),
+                         "available 2027-06-01, after 2026-12-08")
 
 
 if __name__ == "__main__":

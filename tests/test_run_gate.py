@@ -97,6 +97,21 @@ class TestRunStopsForJudgement(unittest.TestCase):
         self.run_cmd()
         self.assertEqual(taken, [0])
 
+    def test_search_fills_the_baseline_a_hand_driven_morning_would_lack(self):
+        """`run` is the way in, but it is not the only one that happens: the
+        morning of 2026-09-21 was driven stage by stage, took no baseline,
+        printed no delta, and the digest worked the numbers out by hand and
+        got two of them wrong. `search` fills that gap - and only fills it,
+        so a `--host` repair cannot reset the morning it is repairing."""
+        taken = []
+        real = cli.core.ensure_baseline
+        cli.core.ensure_baseline = lambda cfg: taken.append(len(self.calls))
+        self.addCleanup(setattr, cli.core, "ensure_baseline", real)
+        with contextlib.redirect_stdout(io.StringIO()):
+            cli.cmd_search(self.args)
+        self.assertEqual(taken, [0])
+        self.assertEqual(self.calls, ["search"])
+
 
 if __name__ == "__main__":
     unittest.main()

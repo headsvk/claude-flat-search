@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import pathlib
+import re
 import sys
 
 from . import audit as audit_mod
@@ -25,8 +26,9 @@ from . import judge as judge_mod
 from . import render as render_mod
 
 
-class Abort(Exception):
-    """A refusal the user needs to read, not a traceback."""
+# Raised here and in core, caught in one place: a refusal from either reads
+# as a refusal, not as a traceback.
+Abort = core.Abort
 
 
 def _load(args) -> config_mod.Config:
@@ -146,6 +148,15 @@ def cmd_finish(args) -> int:
 
 def cmd_search(args) -> int:
     cfg = _load(args)
+    # `run` is the way in, and it takes the baseline itself. This is for the
+    # mornings that do not go that way: a portal re-run with `--host`, or
+    # stages driven by hand. Without it `report` has nothing to difference
+    # against, and on 2026-09-21 that silence ended in a digest that worked
+    # the deltas out by hand and called 18 old rejections new.
+    #
+    # It fills a gap; it never moves a baseline already taken today, because
+    # the repair case would otherwise reset the morning it is repairing.
+    core.ensure_baseline(cfg)
     stage_search(cfg, args)
     return 0
 
@@ -203,18 +214,43 @@ def cmd_check(args) -> int:
     # check is simply skipped. Loading now rejects one, so this line is here to
     # show what was understood - and to say which portals can actually answer it.
     if cfg.move_in:
-        print("move-in     : %s (+%d days slack)"
-              % (cfg.move_in, cfg.move_in_slack_days))
-        print("              Rightmove and OpenRent state a date; Zoopla and")
-        print("              OnTheMarket do not, so theirs stay 'availability")
-        print("              unconfirmed' and are flagged, never rejected.")
+        print("move-in     : %s (+%d days slack)" % (cfg.move_in, cfg.move_in_slack_days))
+        print("              Filtered HERE, against the date each listing states:")
+        print("              a listing stating a later one is REJECTED, one stating")
+        print("              none is kept and read as available now.")
+        # Nothing adds a portal-side availability filter any more, but a URL
+        # pasted from a portal can still carry one, and it costs listings
+        # silently: the portal drops everything it cannot date before this sees
+        # it. Worth reading before a run, not deducing from a thin digest.
+        carried = sorted({u.split("/")[2] for u in cfg.searches
+                          if re.search(r"[?&](moveInByDate|available_from|"
+                                       r"availableBefore)=", u)})
+        if carried:
+            print("              WARNING: these searches still carry the PORTAL's own")
+            print("              availability filter: %s" % ", ".join(carried))
+            print("              It drops every listing the portal cannot date - about")
+            print("              a third of them - before we can read the page. Take it")
+            print("              out of the URL and let the move-in date above do it.")
     else:
         print("move-in     : any (no date set - timing is not ranked on)")
     print("aircon      : %s" % cfg.aircon)
     print("cap         : %d detail pages per run" % cfg.stage2_cap)
+
+    # Say what the NEXT run would ask each portal for, not just what the config
+    # says, because the recency window is computed from the gap since the last
+    # run and a stale state file is exactly when you want to see it spelled out.
+    gap = fetch_mod.days_since_last_run(cfg)
+    print("window      : %s" % (
+        "server-side windowing is OFF (first_run_days = 0)" if not cfg.first_run_days
+        else "no previous run - a first run looks back %d days" % cfg.first_run_days
+        if gap is None else
+        "%d day(s) since the last run, +%d margin"
+        % (gap, fetch_mod.WINDOW_MARGIN_DAYS)))
     print("searches    : %d URL(s)" % len(cfg.searches))
-    for u in cfg.searches:
+    for u, note in fetch_mod.scoped_searches(cfg):
         print("   %s" % u)
+        if note:
+            print("      -> %s" % note)
     drift = fetch_mod.config_url_drift(cfg)
     print()
     if drift:

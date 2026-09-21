@@ -175,6 +175,50 @@ flagged and 4 were new. A page rewritten under a stored verdict is re-flagged ra
 than carried, because `commit` would otherwise collapse the stale quote to `unstated`
 and the listing would never be read again.
 
+### A run only asks for the days it missed
+
+Where a portal can scope a search by listing age, it does. The window is the gap
+since the last committed run plus a small margin — a daily run asks for 3 days
+rather than paging 8469 Zoopla results, 5374 Rightmove ones and 15519 on
+OnTheMarket to find the handful posted overnight — and it is chosen before a
+single page is fetched, unlike `--incremental`, which can only notice staleness
+after fetching it.
+
+Skipping a morning widens the window rather than losing it. Being away longer
+than the widest window a portal offers drops the scoping for that portal and
+pages its backlog, because a window narrower than the gap would lose the
+difference with nothing to show it happened. The ceilings differ — 30 days on
+Zoopla, 14 on Rightmove, 7 on OnTheMarket — so a 10-day gap scopes two of them
+and leaves the third walking everything. OpenRent has no such filter at all,
+which is a pity, because it is also the one portal with no newest-first sort, so
+neither this nor `--incremental` can spare it. A fresh clone has no last run and
+uses `[run] first_run_days`, 14 by default. `flat-search check` prints the window
+the next run would ask for, and every run logs it.
+
+**Availability is the one filter this pipeline will not ask a portal for.**
+Three of the four offer one, and asking costs about a third of the inventory:
+Zoopla returns 6139 of 8469 at its widest window, and widening from three months
+to twelve adds 28 listings, so the ~2330 that never come back are not late — the
+portal simply holds no date for them. Rejecting a listing because a portal has
+no data about it is exactly what `min_sqft` and the district list refuse to do,
+and doing it server-side is worse, because nothing downstream can flag what
+never arrived.
+
+So `move_in` filters here instead, against the date the listing itself states:
+state a date past the window and you are rejected like an undersized flat; state
+none and you are kept and read as available now. That became practical once all
+four portals' dates were readable — Rightmove and OnTheMarket label theirs,
+Zoopla renders it as a key fact, OpenRent writes it into the advert. If a search
+URL still carries `moveInByDate=`, `available_from=` or `availableBefore=`,
+`flat-search check` says so and tells you to take it out.
+
+**None of these parameter values are guesses, and they could not safely be.**
+Three of the four fail *closed* on a value they do not recognise — `maxDaysSinceAdded=30`,
+`moveInByDate=someday` and Zoopla's own UI value `available_from=immediately`
+each return zero results, which this pipeline is built to read as a possible
+block. Every value in the tables has a measured count beside it in
+[docs/portals.md](docs/portals.md).
+
 ## Outside London
 
 Nothing in the filtering is London-specific. Postcode districts are parsed from the

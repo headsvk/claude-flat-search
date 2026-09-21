@@ -27,6 +27,7 @@ Setup:  uv sync && uv run playwright install chromium
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import pathlib
 import random
 import re
@@ -157,6 +158,107 @@ class Session:
         return self.text
 
 
+# A run's recency window is the gap since the last one PLUS this, because the
+# gap is measured from when the last run committed and listings keep arriving
+# while it runs. Two days is cheap; the failure it prevents is silent.
+WINDOW_MARGIN_DAYS = 2
+
+
+def days_since_last_run(cfg) -> int | None:
+    """Whole days since state was last written, or None if it never was.
+
+    `updated` is stamped by every save_state, so it marks the last run that
+    actually committed something - which is the right mark. A run that searched
+    and then refused to commit (a challenged portal) leaves the stamp alone, so
+    the next run widens its window to cover the morning that was lost.
+    """
+    state_path = cfg.state_path
+    if not state_path.exists():
+        return None
+    stamp = str(core.read_json(state_path).get("updated") or "").strip()
+    if not stamp:
+        return None
+    try:
+        then = dt.datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    return max(0, (dt.datetime.now() - then).days)
+
+
+def add_param(url: str, param: str, value: str) -> str:
+    """Append one query parameter, whichever way the URL is written.
+
+    A URL built on a portal's own filter page usually carries a query string
+    already - every one in the config today does - but not always: OnTheMarket
+    and OpenRent both have path-only forms, and `url + "&added=3_days"` on one
+    of those puts an ampersand in a path. Neither outcome is loud. A portal
+    that ignores the parameter pages its whole backlog, which reads as a busy
+    morning; one that 404s returns nothing, which reads as a quiet one.
+    """
+    return "%s%s%s=%s" % (url, "&" if "?" in url else "?", param, value)
+
+
+def scope_search_url(url: str, cfg, gap_days: int | None) -> tuple[str, str | None]:
+    """Narrow one search URL at the portal. -> (url, note or None).
+
+    Doing this server-side is strictly cheaper than the client-side stop rule
+    it complements: `--incremental` only stops early on newest-first portals,
+    and only after two nearly-stale pages, so it is a heuristic laid over a
+    full walk. A window is arithmetic done before anything is sent.
+
+    A parameter already written into the config URL is left exactly as it is -
+    it is a deliberate choice by whoever wrote it, and quietly appending a
+    second value for the same filter is how you get an unreadable URL that
+    neither of you chose.
+    """
+    notes = []
+
+    recent = portals.window_for(url, portals.RECENT_WINDOWS)
+    if recent and cfg.first_run_days:
+        param, offered = recent
+        if re.search(r"[?&]" + re.escape(param) + r"=", url):
+            notes.append("%s= already in the URL, left alone" % param)
+        else:
+            want = (cfg.first_run_days if gap_days is None
+                    else gap_days + WINDOW_MARGIN_DAYS)
+            days = portals.snap_up(want, offered)
+            if days is None:
+                # Been away longer than the portal will scope. Page the lot -
+                # a window narrower than the gap loses the difference silently.
+                notes.append("%d-day gap is wider than any %s= window - not scoped"
+                             % (want, param))
+            else:
+                url = add_param(url, param, offered[days])
+                notes.append("%s=%s (%s)" % (param, offered[days],
+                                             "first run" if gap_days is None
+                                             else "%d days since the last run" % gap_days))
+
+    # Availability is NOT added here, and that is deliberate. A move-in
+    # deadline is something you state on the portal, in the same filter panel
+    # as the price and the bed count, and the URL you paste into [searches] is
+    # that statement. This module used to append one of its own from
+    # `move_in`, which meant editing a date in criteria.toml silently changed
+    # what four portals returned - the runbook had to carry a warning that a
+    # sharp drop in counts the next morning was not a broken extractor.
+    #
+    # The line between the two is what the run knows that the URL cannot say:
+    # the recency window above is measured from the last run and has to be
+    # computed fresh every morning. A move-in date is not - and a move-in date
+    # is filtered HERE, in hard_filter, against the date each listing states,
+    # so nothing is asked of the portal at all.
+    return url, "; ".join(notes) or None
+
+
+def scoped_searches(cfg) -> list:
+    """Every search URL, narrowed where the portal supports it, with a log."""
+    gap = days_since_last_run(cfg)
+    out = []
+    for url in cfg.searches:
+        scoped, note = scope_search_url(url, cfg, gap)
+        out.append((scoped, note))
+    return out
+
+
 async def collect(url: str, seen: set, known: set | None = None,
                   incremental: bool = False) -> tuple[list, str]:
     """One search URL, its own browser. Returns (new listings, status)."""
@@ -226,9 +328,13 @@ async def run_search(cfg, out_path, incremental: bool = False) -> bool:
     """
     await preflight(cfg)
     out_path = pathlib.Path(out_path)
-    urls = list(cfg.searches)
-    if not urls:
+    if not cfg.searches:
         raise RuntimeError("no [searches] URLs in the config")
+    urls = []
+    for url, note in scoped_searches(cfg):
+        urls.append(url)
+        if note:
+            print("  window %-16s %s" % (url.split("/")[2], note), flush=True)
     known = set()
     if incremental:
         known = core.known_urls(cfg)
@@ -371,7 +477,9 @@ async def run_details(cfg, queue_path, stage1_path, host=None):
                                 v = clean_value(m.group(1))
                                 if v:
                                     parts.append("%s: %s" % (label, v))
-                                    info[key] = v
+                                    # "Now" is a date; "Ask agent" is not one.
+                                    info[key] = (portals.availability_value(v) or v
+                                                 if key == "available_from" else v)
                     row = by_url.get(it["url"]) or {}
                     if not (info.get("size_sqft") or row.get("size_sqft")):
                         plan = await floorplan_size(s, html, pt["name"], cfg, it["url"])
