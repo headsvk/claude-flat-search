@@ -108,10 +108,33 @@ The reason is in the counts above. Widening Zoopla's window from three months to
 twelve adds **28 listings** and stops at 6139 of 8469: no window ever reaches the
 other ~2330, which is what you would expect of listings the portal holds no
 availability data for, not of listings that are merely late. Rightmove behaves
-the same way, ceiling ~3744 of 5374. So the filter's real effect is to drop about
-a third of each portal's inventory for having nothing to say — rejecting on
-missing data, server-side, where nothing downstream can flag it. That is the one
-move this pipeline refuses everywhere else.
+the same way, ceiling ~3744 of 5374.
+
+**That was an inference until it was tested, 2026-09-21.** One search URL — 2
+bed, 2 bath, £4500, `added=3_days` — run with and without
+`available_from=12months` minutes apart, the result sets diffed, and the detail
+page of a random sample from each side read:
+
+| sample | states a date on its page |
+|---|---|
+| dropped by the filter | **1 of 15** |
+| returned by it (control) | **15 of 15** |
+
+So the filter selects on whether the page states a date, not on whether the flat
+is late. The sharpest single case: it **dropped** a listing whose page says it is
+available now, and **kept** one stating 2027-06-10. Rejecting on missing data,
+server-side, where nothing downstream can flag what never arrived — the one move
+this pipeline refuses everywhere else.
+
+**But do not quote "a third" for a narrow search.** The same run returned 213
+listings unfiltered and 203 filtered — about 5%, not 27%. The 8469/6139 figures
+are measured on the unscoped London corpus, where far more listings are old or
+dateless; a recency-scoped search is mostly fresh adverts, which mostly state a
+date. A caveat on both numbers: 44 listings appeared in the filtered run that
+were absent from the unfiltered one minutes earlier, so these result sets churn,
+and the 49 "dropped" are a noisy count. The sample rates above are not noisy -
+churn would have given the dropped side the same date rate as the control, and
+it is 1 in 15 against 15 in 15.
 
 The original case for using them was that Zoopla published no date, so the filter
 was the only evidence there was. That turned out to be false (see the table

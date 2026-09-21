@@ -196,10 +196,13 @@ uses `[run] first_run_days`, 14 by default. `flat-search check` prints the windo
 the next run would ask for, and every run logs it.
 
 **Availability is the one filter this pipeline will not ask a portal for.**
-Three of the four offer one, and asking costs about a third of the inventory:
-Zoopla returns 6139 of 8469 at its widest window, and widening from three months
-to twelve adds 28 listings, so the ~2330 that never come back are not late — the
-portal simply holds no date for them. Rejecting a listing because a portal has
+Three of the four offer one, and what it removes is not late flats but undated
+ones: of 15 listings dropped by Zoopla's filter, 1 stated a date on its page,
+against 15 of 15 in the control — it dropped a flat whose page says "available
+now" and kept one stating 2027-06-10. On the unscoped London corpus that is
+about a third of the inventory (6139 of 8469, and widening the window from three
+months to twelve adds 28 listings); on a narrow recency-scoped search it is far
+less, measured at 213 against 203. Rejecting a listing because a portal has
 no data about it is exactly what `min_sqft` and the district list refuse to do,
 and doing it server-side is worse, because nothing downstream can flag what
 never arrived.

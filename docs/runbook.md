@@ -90,8 +90,8 @@ worth reacting to:
     a search URL. `move_in` is filtered here instead, against the date each
     listing states: a stated date past the window is a rejection like an
     undersized flat, and a listing that states nothing is kept. A portal's own
-    filter would instead drop everything it cannot date — about a third of its
-    inventory — before this ever saw it. If a URL still carries `moveInByDate=`,
+    filter would instead drop everything it cannot date — 14 of 15 sampled
+    listings it dropped stated no date at all — before this ever saw it. If a URL still carries `moveInByDate=`,
     `available_from=` or `availableBefore=`, `flat-search check` warns; take it
     out, or the morning's counts will be a third short with nothing to show it.
 
