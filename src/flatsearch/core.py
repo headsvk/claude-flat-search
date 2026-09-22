@@ -199,8 +199,11 @@ def base_tier(listing: dict, cfg: dict) -> tuple[int, list[str]]:
     # No MOVE_IN_DATE set means timing is flexible - say nothing about dates.
 
     if cfg.min_bathrooms and listing.get("bathrooms") is None:
-        # OpenRent filters bathrooms server-side but never prints the count, so
+        # OpenRent filters bathrooms server-side but its search CARD never
+        # prints the count, so for a listing whose detail page has not been read
         # the search itself is the evidence - do not flag those as unconfirmed.
+        # Once the detail page IS read, `bathrooms` is a stated number and this
+        # branch is not reached at all.
         if listing.get("bathrooms_verified_by_search"):
             notes.append("bathrooms >= min (verified by search filter)")
         else:

@@ -158,6 +158,75 @@ class TestLooksLikeAPlan(unittest.TestCase):
 # plan_urls - pure regex over each portal's HTML.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Which floor the plan is of. Pure text, like parse_area.
+# ---------------------------------------------------------------------------
+
+# The OCR of OpenRent 3048266's plan, verbatim, degree signs and all - the
+# image is the landlord's copyright, the text it produced is the evidence.
+BURNHAM = ("Kitchen / Dining /\n\nReception Room\n22\u00b02 (6.76) max\n"
+           "x 13'1 (3.99) max\n\n\\n\n11\u00b07 (3.53) max\nx 10'8 (3.25) max\n\n"
+           "Bedroom\n13\u00b08 (4.17) max\nx 13\u00b04 (4.06)\n\nLower Ground Floor\n")
+
+
+class TestPlanFloors(unittest.TestCase):
+    """This plan states no area at all, so parse_area finds nothing and the
+    whole OCR used to be discarded - including the last line, which is the one
+    thing that decides the listing. It went out as a High-priority suggestion."""
+
+    def test_the_case_that_shipped(self):
+        self.assertEqual(floorplan.parse_area(BURNHAM)["sqft"], None)
+        self.assertEqual(floorplan.plan_floors(BURNHAM), ["lower ground"])
+        self.assertEqual(floorplan.floor_from_plan(floorplan.plan_floors(BURNHAM)),
+                         {"floor_level": "lower_ground"})
+
+    def test_degree_sign_counts_as_a_feet_mark(self):
+        """Tesseract read the same image's feet marks both ways: 22\u00b02 beside
+        13'1. A dimension detector that only knows the apostrophe sees half."""
+        self.assertTrue(floorplan.is_plan_text(BURNHAM))
+
+    def test_a_photograph_is_not_a_plan(self):
+        for noise in ("", "Welcome home 2020", "Kitchen", "Rent PCM 3250"):
+            with self.subTest(noise=noise):
+                self.assertFalse(floorplan.is_plan_text(noise))
+
+    def test_ordinal_forms(self):
+        for text, want in (("Second Floor", {"floor_number": 2}),
+                           ("3rd Floor", {"floor_number": 3}),
+                           ("Ground Floor", {"floor_level": "ground"}),
+                           ("Basement", {})):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    floorplan.floor_from_plan(floorplan.plan_floors(text)), want)
+
+    def test_basement_label_is_lower_ground(self):
+        self.assertEqual(floorplan.floor_from_plan(["basement"]),
+                         {"floor_level": "lower_ground"})
+
+    def test_lower_ground_wins_over_a_second_level(self):
+        """A maisonette running down to a lower ground floor is still half below
+        ground, and the description saying so has always rejected it."""
+        floors = floorplan.plan_floors("Ground Floor\nLower Ground Floor")
+        self.assertEqual(floors, ["ground", "lower ground"])
+        self.assertEqual(floorplan.floor_from_plan(floors),
+                         {"floor_level": "lower_ground"})
+
+    def test_two_ordinals_state_nothing(self):
+        """'First Floor' and 'Second Floor' on one plan give no honest answer to
+        which floor the flat is on, so it stays unknown rather than guessed."""
+        self.assertEqual(
+            floorplan.floor_from_plan(["first", "second"]), {})
+
+    def test_labels_are_deduplicated_in_page_order(self):
+        self.assertEqual(
+            floorplan.plan_floors("Ground Floor ... GROUND FLOOR ... First Floor"),
+            ["ground", "first"])
+
+    def test_bare_word_is_not_a_floor_label(self):
+        """'Ground' in 'Ground Rent' is not a storey."""
+        self.assertEqual(floorplan.plan_floors("Ground Rent 250"), [])
+
+
 class TestPlanUrls(unittest.TestCase):
 
     def test_rightmove_prefers_full_size_over_thumbnail(self):

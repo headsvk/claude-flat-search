@@ -36,6 +36,7 @@ import sys
 
 from . import core
 from . import floorplan
+from . import judge
 from . import portals
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -56,6 +57,17 @@ REGION_DISTRICT = {
     "REGION%5E317": ("IG7", "Chigwell"),
     "OUTCODE%5E855": ("EN5", "High Barnet"),
 }
+
+
+class Challenged(RuntimeError):
+    """A bot check came back instead of the page.
+
+    Its own type because the two callers want opposite things from it: a
+    challenged SEARCH is a hard error - an empty result set and a block look
+    identical, and the quiet one is the dangerous one - while a challenged
+    DETAIL page is worth retrying in a fresh session, which is measurably
+    enough to get past it.
+    """
 
 
 class Session:
@@ -91,6 +103,28 @@ class Session:
                 pass
         return None
 
+    async def recycle(self):
+        """Throw this browser context away and open a clean one.
+
+        Measured 2026-09-22 against Zoopla, three listings per variant:
+
+            one page, 3s gap      ok, CHALLENGED, CHALLENGED
+            one page, 20s gap     ok, CHALLENGED, CHALLENGED
+            fresh CONTEXT, 3s     ok, ok, ok
+
+        So the bot check is not about the rate - twenty seconds behaves exactly
+        like three - it is about the context. A clean one clears it, and that is
+        the cheap half of what the retry pass was already doing by launching a
+        whole second browser.
+        """
+        try:
+            await self._ctx.close()
+        except Exception:
+            pass
+        self._ctx = await self._b.new_context(user_agent=UA, locale="en-GB")
+        self.page = await self._ctx.new_page()
+        self._consented = False
+
     async def get(self, url: str, settle=4000) -> str:
         if self._first:
             self._first = False
@@ -106,8 +140,8 @@ class Session:
             body = await self.page.inner_text("body")
         except Exception:
             body = ""
-        if portals.CHALLENGE.search(body[:4000]):
-            raise RuntimeError("CHALLENGED by %s" % url.split("/")[2])
+        if portals.challenged(html, body):
+            raise Challenged("CHALLENGED by %s" % url.split("/")[2])
         self.text = body
         return html
 
@@ -428,7 +462,73 @@ async def floorplan_size(session, html, portal_name, cfg, url):
         return None
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-    return result if result.get("sqft") else None
+    # Not just a size any more: a plan with no total area still names its
+    # floor, and that read was being dropped with the rest of the OCR.
+    return result if (result.get("sqft") or result.get("floors")) else None
+
+
+async def enrich_detail(session, pt, url, html, text, parts, info, row, cfg):
+    """Everything read AFTER the portal's own detail extractor: Rightmove's
+    labelled fields, and the floorplan.
+
+    This exists as one function because it used to be written out inline in the
+    main pass and silently omitted from the retry pass. Zoopla serves a stub for
+    every listing after the first in a session - measured 496,259 chars for the
+    first and 28,781 for the rest, with the whole embedded payload gone - so the
+    stub extracts to nothing, trips the empty-page guard, and is retried in a
+    fresh session. That means effectively EVERY Zoopla listing arrives through
+    the retry path. The description came back, so the listings looked healthy;
+    the floorplan read simply never ran. 0 of 126 Zoopla pages carried one.
+    """
+    if pt["name"] == "Rightmove":
+        flat = portals.untag(html)
+        for label, key in (("Furnish type", "furnished"),
+                           ("Let available date", "available_from")):
+            m = re.search(re.escape(label) + r"\s*:?\s*([A-Za-z0-9 /,-]{2,30})", flat)
+            if m:
+                v = clean_value(m.group(1))
+                if v:
+                    parts.append("%s: %s" % (label, v))
+                    # "Now" is a date; "Ask agent" is not one.
+                    info[key] = (portals.availability_value(v) or v
+                                 if key == "available_from" else v)
+
+    row = row or {}
+    # The plan is read when the listing states no size, and ALSO when it states
+    # no floor. It was only ever the size before, which left 230 live listings
+    # with a stated size and an unknown floor that no plan was ever read for -
+    # and lower ground is a hard reject, so an unread plan there is a listing
+    # recommended on a missing fact. The floor known from the prose counts:
+    # judge.amenities is pure text and costs nothing to ask here.
+    prose = judge.amenities(text or "")
+    knows_size = bool(info.get("size_sqft") or row.get("size_sqft"))
+    knows_floor = bool(info.get("floor_level") or info.get("floor_number")
+                       or row.get("floor_level") or row.get("floor_number")
+                       or prose.get("floor_level") or prose.get("floor_number"))
+    if knows_size and knows_floor:
+        return
+    plan = await floorplan_size(session, html, pt["name"], cfg, url)
+    if plan and plan.get("sqft") and not knows_size:
+        info["size_sqft_plan"] = plan["sqft"]
+        info["size_plan_basis"] = plan["basis"]
+        info["size_plan_confident"] = plan["confident"]
+        parts.append(
+            "Floorplan area: %d sq ft (%s, %s) - read by OCR from %s"
+            % (plan["sqft"], plan["basis"],
+               "clear" if plan["confident"] else "AMBIGUOUS - verify",
+               plan.get("image", "")))
+        parts.append("Floorplan text: " + plan.get("evidence", ""))
+    # A plan states which floor it is whether or not it states an area, and
+    # lower ground is a hard reject - so the floor is kept even when the size
+    # read came back empty, which is the case that used to discard the whole
+    # OCR. Unlike the size, this DOES reach the hard filter: a misread digit
+    # turns 814 into 314, but the phrase "Lower Ground Floor" does not misread
+    # into a different storey.
+    if plan and plan.get("floors") and not knows_floor:
+        parts.append("Floorplan floors: %s - read by OCR from %s"
+                     % (", ".join(plan["floors"]), plan.get("image", "")))
+        for k, v in floorplan.floor_from_plan(plan["floors"]).items():
+            info.setdefault(k, v)
 
 
 async def run_details(cfg, queue_path, stage1_path, host=None):
@@ -459,46 +559,34 @@ async def run_details(cfg, queue_path, stage1_path, host=None):
         # These tally the whole run across all four workers.
         nonlocal done, failed
         pt = portals.portal_for(group[0]["url"])
-        host_done = host_failed = 0
+        host_done = host_failed = host_challenged = 0
         retry: list = []
         print('\n' + "--- %s: %d to fetch ---" % (host, len(group)))
         async with Session() as s:
             for it in group:
                 try:
-                    html = await s.get(it["url"], settle=3000)
+                    try:
+                        html = await s.get(it["url"], settle=3000)
+                    except Challenged:
+                        # A clean context clears the check; waiting does not.
+                        # One attempt at that before handing the listing to the
+                        # retry pass, which pays for a whole new browser.
+                        host_challenged += 1
+                        print("  challenged %-30s -> clean context, retrying"
+                              % it["url"][-30:])
+                        await s.recycle()
+                        html = await s.get(it["url"], settle=3000)
                     text = await s.expand()
                     parts, info = pt["detail"](html, text)
-                    if pt["name"] == "Rightmove":
-                        flat = portals.untag(html)
-                        for label, key in (("Furnish type", "furnished"),
-                                           ("Let available date", "available_from")):
-                            m = re.search(re.escape(label) + r"\s*:?\s*([A-Za-z0-9 /,-]{2,30})", flat)
-                            if m:
-                                v = clean_value(m.group(1))
-                                if v:
-                                    parts.append("%s: %s" % (label, v))
-                                    # "Now" is a date; "Ask agent" is not one.
-                                    info[key] = (portals.availability_value(v) or v
-                                                 if key == "available_from" else v)
-                    row = by_url.get(it["url"]) or {}
-                    if not (info.get("size_sqft") or row.get("size_sqft")):
-                        plan = await floorplan_size(s, html, pt["name"], cfg, it["url"])
-                        if plan:
-                            info["size_sqft_plan"] = plan["sqft"]
-                            info["size_plan_basis"] = plan["basis"]
-                            info["size_plan_confident"] = plan["confident"]
-                            parts.append(
-                                "Floorplan area: %d sq ft (%s, %s) - read by OCR from %s"
-                                % (plan["sqft"], plan["basis"],
-                                   "clear" if plan["confident"] else "AMBIGUOUS - verify",
-                                   plan.get("image", "")))
-                            parts.append("Floorplan text: " + plan.get("evidence", ""))
+                    await enrich_detail(s, pt, it["url"], html, text,
+                                        parts, info, by_url.get(it["url"]), cfg)
                     text = "\n".join(parts)
                     if not text.strip():
-                        # One browser page is reused across navigations, and some
-                        # portals - Zoopla measurably - serve the first listing in
-                        # full and blanks afterwards. Retry once in a fresh
-                        # session before believing the listing is contentless.
+                        # A page that rendered nothing. Until 2026-09-22 this also
+                        # silently absorbed every Zoopla bot challenge, because the
+                        # challenge was not recognised and extracted to nothing -
+                        # see Challenged. Retry once in a fresh session before
+                        # believing the listing is contentless.
                         retry.append(it)
                         continue
                     core.write_json(pathlib.Path(it["cache_path"]),
@@ -512,6 +600,16 @@ async def run_details(cfg, queue_path, stage1_path, host=None):
                     done += 1
                     host_done += 1
                     print("  ok %-46s %5d chars" % (it["url"][-46:], len(text)))
+                except Challenged:
+                    # Challenged again on a clean context. Not a failure - the
+                    # retry pass gets a whole new browser and that has always
+                    # been enough - but counted and printed either way, because
+                    # a portal quietly serving bot checks for half a run is
+                    # exactly what must not pass for a healthy fetch.
+                    print("  challenged %-30s -> retry in a fresh session"
+                          % it["url"][-30:])
+                    retry.append(it)
+                    continue
                 except Exception as e:
                     print("  FAIL %-42s %s" % (it["url"][-42:], str(e)[:60]))
                     failed += 1
@@ -523,6 +621,8 @@ async def run_details(cfg, queue_path, stage1_path, host=None):
                     html = await s2.get(it["url"], settle=5000)
                     text = await s2.expand()
                     parts, info = pt["detail"](html, text)
+                    await enrich_detail(s2, pt, it["url"], html, text,
+                                        parts, info, by_url.get(it["url"]), cfg)
                     text = chr(10).join(parts)
                     if text.strip():
                         core.write_json(pathlib.Path(it["cache_path"]),
@@ -551,8 +651,9 @@ async def run_details(cfg, queue_path, stage1_path, host=None):
         # across the other three.
         total = host_done + host_failed
         rate = (100.0 * host_failed / total) if total else 0.0
-        print("--- %s: ok %d, missed %d (%.0f%%) %s" % (
+        print("--- %s: ok %d, missed %d (%.0f%%)%s %s" % (
             host, host_done, host_failed, rate,
+            ", %d bot-challenged" % host_challenged if host_challenged else "",
             "*** CHECK THE EXTRACTOR ***" if rate >= 10 and total >= 10 else ""))
     await asyncio.gather(*(run_host(h, g) for h, g in groups.items()))
     core.write_json(stage1_path, stage1)

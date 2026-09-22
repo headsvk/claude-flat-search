@@ -68,6 +68,22 @@ LIFT_NO = re.compile(r"\bno lift|without a lift|\bwalk[- ]?up\b|\bno elevator", 
 CONCIERGE = re.compile(r"concierge|porter(?:age)?\b|door\s?man", re.I)
 SQFT = re.compile(r"([\d,]{3,6})\s*sq\.?\s*(?:ft|feet)", re.I)
 
+# The cached text is not all the portal's words. `fetch.enrich_detail` appends
+# its own evidence lines to it, and two of them state a square footage that came
+# off a floorplan by OCR:
+#
+#     Floorplan area: 759 sq ft (total, clear) - read by OCR from https://...
+#     Floorplan text: ...Total area: approx. 70.5 sq. metres (758.6 sq. feet
+#
+# Read back by the size scan below, an OCR'd number becomes a STATED size - and
+# a stated size reaches hard_filter, which deletes anything under min_sqft. That
+# is precisely what fetch.floorplan_size promises cannot happen: "recorded as
+# size_sqft_plan, never as size_sqft, so it cannot reach the hard filter - a
+# misread plan must not delete a flat". The promise was defeated by the evidence
+# line the same function writes. Measured 2026-09-22: 40 of the 41 records
+# holding a plan area also held it as size_sqft.
+PLAN_LINE = re.compile(r"^floorplan (?:area|text|floors):.*$", re.I | re.M)
+
 # "Refurbished" is a promotion signal, but the same words describe a WRECK when
 # they point forwards: "in need of refurbishment", "scope for renovation". Those
 # mean the flat needs the work done, which is the opposite of what we want, so
@@ -121,8 +137,10 @@ def amenities(text: str) -> dict:
     elif REFURB_POS.search(low):
         out["condition"] = "refurbished"
 
+    # Not `low`: a size is only a size when the PORTAL said it. The
+    # floorplan lines are this pipeline's own OCR, quoted back.
     best = None
-    for m in SQFT.finditer(low):
+    for m in SQFT.finditer(PLAN_LINE.sub("", low)):
         v = int(m.group(1).replace(",", ""))
         if 250 <= v <= 20000 and (best is None or v > best):
             best = v

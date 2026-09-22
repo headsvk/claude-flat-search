@@ -22,7 +22,65 @@ is why its search URL carries no bathroom parameter — passing one would imply 
 guarantee that does not exist.
 
 OpenRent never prints a bathroom count on the card, but its server filter does work.
-Those rows carry `bathrooms_verified_by_search` rather than an invented number.
+A row carries `bathrooms_verified_by_search` rather than an invented number until
+its detail page is read.
+
+**The OpenRent DETAIL page does state the count**, in a block under the title:
+
+```
+2 Bed Flat, Hopgood Tower, SE3
+2 bedrooms
+2 bathrooms
+4 tenants max.
+```
+
+`openrent_detail` reads it off a whole line — the description's own prose
+("2 bathrooms (1 en-suite), modern kitchen") is the agent's claim, not the
+portal's field. Until 2026-09-22 nothing read it, and all 399 tracked OpenRent
+listings rendered as `2/?` while the page said 2.
+
+## Zoopla bot-challenges everything after the first listing in a session
+
+Measured 2026-09-22. Zoopla serves one real page per browser session; every
+listing after it comes back as a **Cloudflare bot check**, not a page:
+
+```
+title : Just a moment...
+body  : www.zoopla.co.uk
+        Performing security verification
+        Ray ID: a3f20ea2dd46a0d7 - Performance and Security by Cloudflare
+html  : 28,781 chars, against 419,248-499,837 for a real listing
+```
+
+**Pacing does not help; a clean context does.** Three listings per variant:
+
+| variant | result |
+|---|---|
+| one page, 3s gap | ok, CHALLENGED, CHALLENGED |
+| one page, 20s gap | ok, CHALLENGED, CHALLENGED |
+| fresh context per listing, 3s gap | ok, ok, ok |
+
+Twenty seconds behaves exactly like three, so it is the context, not the rate.
+
+This went unnoticed for five days because of a near miss in the detector.
+`CHALLENGE` already matched `just a moment` — but the fetch layer tested it
+against the body text only, and "Just a moment..." is the **title**. The body
+says "Performing security verification", which the pattern did not cover. So
+neither half was recognised, the challenge extracted to nothing, and the
+empty-page guard retried it in a fresh session, where it is the first listing
+again and comes back whole.
+
+The recovery worked, which is why Zoopla listings always looked healthy — but
+it meant every Zoopla listing was fetched twice, and anything the retry pass
+did not do was never done for Zoopla at all. It did not read floorplans:
+0 of 126 Zoopla pages carried one, against 67 of 525 on Rightmove.
+
+Now: `portals.challenged()` reads the title as well as the body; a challenged
+detail page raises `fetch.Challenged`, which recycles the browser context
+(`Session.recycle`) and re-fetches once before falling through to the retry
+pass, and is counted and printed either way rather than passing for an empty
+page; and everything read after the portal's own extractor lives in
+`fetch.enrich_detail`, called from both passes.
 
 ## Sort order
 

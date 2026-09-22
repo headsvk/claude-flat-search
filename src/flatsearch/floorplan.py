@@ -24,6 +24,10 @@ NOT confident rather than guessed at - the caller must not hard-reject on it.
 
 Square feet stated on the plan always beat converting the square metres: the
 OpenRent plan says 73 sq m and 791 sq ft, and 73 x 10.7639 is 785.8.
+
+The area is not the only thing a plan states. One that prints no total at
+all - room dimensions only - still prints which floor it is, and lower
+ground is a hard reject in its own right. See `plan_floors`.
 """
 from __future__ import annotations
 
@@ -144,6 +148,84 @@ def looks_like_a_plan(result: dict) -> bool:
 
 
 # --------------------------------------------------------------------------
+# which floor the plan is of
+# --------------------------------------------------------------------------
+# A plan that states no total area still states which FLOOR it is, and that is
+# a hard requirement of its own - lower ground and basement are an outright no.
+#
+# Measured 2026-09-22 on OpenRent 3048266 (Burnham Court, W2). The plan was
+# found, ranked first by plan_score (0.835, next best 0.382) and OCR'd
+# correctly. Its only numbers are room dimensions - "22'2 (6.76) max" - so
+# parse_area found no total, area_from_candidates returned None, and the whole
+# read was dropped. The last line of that discarded text was "Lower Ground
+# Floor". The listing went out as a High-priority suggestion.
+#
+# So: the area is no longer the only thing worth keeping off a plan.
+
+# OCR renders the feet mark as ' or the degree sign, measured in the same
+# image: "22°2 (6.76) max" beside "13'1 (3.99) max".
+DIMENSION = re.compile(r"\d{1,2}\s*['\u2018\u2019\u00b0]\s*\d{1,2}"
+                       r"|\(\s*\d{1,2}\.\d{2}\s*\)")
+
+ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+            "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10}
+
+FLOOR_LABEL = re.compile(
+    r"\b(lower\s+ground|upper\s+ground|ground|basement|mezzanine"
+    r"|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth"
+    r"|\d{1,2}(?:st|nd|rd|th))\s+floor\b", re.I)
+
+
+def plan_floors(text: str) -> list:
+    """Floor labels printed on the plan, normalised, in order, deduplicated.
+
+    A plan is a drawing OF THE UNIT, so a label on it names the unit's own
+    level. That is the difference from prose, where a bare "ground floor" is as
+    likely to be the concierge's - see judge.FLOOR_PAT, which will not read one.
+    """
+    out = []
+    for m in FLOOR_LABEL.finditer(text or ""):
+        label = " ".join(m.group(1).split()).lower()
+        if label not in out:
+            out.append(label)
+    return out
+
+
+def is_plan_text(text: str) -> bool:
+    """Does this OCR come from a floorplan rather than a photograph?
+
+    `looks_like_a_plan` answers the same question by whether an area was read,
+    which is self-validating but only works on a plan that states one. Room
+    dimensions are the thing every plan has and no photograph does: two of them,
+    or one beside a floor label.
+    """
+    dims = len(DIMENSION.findall(text or ""))
+    return dims >= 2 or (dims >= 1 and bool(plan_floors(text)))
+
+
+def floor_from_plan(floors: list) -> dict:
+    """-> {floor_level} / {floor_number} / {} for the labels a plan states.
+
+    Deliberately narrow. A plan naming lower ground or basement ANYWHERE is
+    read as a lower-ground flat, exactly as the same words in the description
+    are - a maisonette that runs down to a lower ground floor is still half
+    below ground, and judge.LOWER_GROUND has never made that distinction
+    either. Anything else is only read when the plan names a single level,
+    because two ordinals give no honest answer to "which floor is it on".
+    """
+    if any(f in ("lower ground", "basement") for f in floors):
+        return {"floor_level": "lower_ground"}
+    if len(floors) != 1:
+        return {}
+    only = floors[0]
+    if only in ("ground", "upper ground"):
+        return {"floor_level": "ground"}
+    digits = re.match(r"(\d{1,2})", only)
+    n = int(digits.group(1)) if digits else ORDINALS.get(only)
+    return {"floor_number": n} if n else {}
+
+
+# --------------------------------------------------------------------------
 # finding the plan
 # --------------------------------------------------------------------------
 
@@ -215,10 +297,16 @@ def download(url: str, dest: pathlib.Path) -> bool:
 
 
 def area_from_candidates(urls: list, workdir: pathlib.Path, limit: int = 3) -> dict:
-    """Download candidates, read the most plan-like first, stop at the first area.
+    """Download candidates, read the most plan-like first, keep what the plan says.
 
     `limit` caps how many images get OCR'd per listing; with candidates ranked by
     plan_score the real plan is first on every sample measured so far.
+
+    An area ends the search. A plan with no area does NOT: it still states its
+    floor, and that was being thrown away - see `plan_floors`. So the first
+    plan-looking text is held onto and returned when no area turns up, with
+    `sqft` None exactly as before. Callers that only want a size still get one
+    or nothing; the floor is extra, never a substitute.
     """
     workdir.mkdir(parents=True, exist_ok=True)
     scored = []
@@ -227,13 +315,20 @@ def area_from_candidates(urls: list, workdir: pathlib.Path, limit: int = 3) -> d
         if download(u, dest):
             scored.append((plan_score(dest), u, dest))
     scored.sort(reverse=True, key=lambda t: t[0])
+    fallback = None
     for score, u, dest in scored[:limit]:
-        result = area_from_image(dest)
+        text = ocr(dest)
+        result = parse_area(text)
+        result["text"] = text
+        result["floors"] = plan_floors(text)
+        result["image"] = u
+        result["score"] = round(score, 3)
         if result["sqft"]:
-            result["image"] = u
-            result["score"] = round(score, 3)
             return result
-    return {"sqft": None, "basis": "", "evidence": "", "confident": False, "image": "", "score": 0.0}
+        if fallback is None and is_plan_text(text):
+            fallback = result
+    return fallback or {"sqft": None, "basis": "", "evidence": "", "confident": False,
+                        "image": "", "score": 0.0, "text": "", "floors": []}
 
 
 if __name__ == "__main__":

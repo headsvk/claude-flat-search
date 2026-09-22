@@ -89,8 +89,24 @@ def blank(url, title, platform, **kw):
     return row
 
 
+# Measured 2026-09-22 on a live Zoopla challenge page. The words that identify
+# it are split across the document: "Just a moment..." is the TITLE, and the
+# only thing the body says is "Performing security verification". Matching the
+# body alone - which is what the fetch layer did - therefore missed every one
+# of them, and a challenge that is not recognised is indistinguishable from a
+# page with nothing on it.
 CHALLENGE = re.compile(r"just a moment|verify you are human|unusual traffic|"
-                       r"access denied|are you a robot|captcha", re.I)
+                       r"access denied|are you a robot|captcha|"
+                       r"security verification|checking your browser|"
+                       r"enable javascript and cookies to continue", re.I)
+
+
+def challenged(html: str, body: str) -> bool:
+    """Is this a bot check rather than a page? Title AND body, because the two
+    halves of the evidence are not in the same place."""
+    title = re.search(r"<title[^>]*>(.*?)</title>", html or "", re.I | re.S)
+    return bool(CHALLENGE.search(body[:4000] or "")
+                or (title and CHALLENGE.search(title.group(1)[:200])))
 
 
 # Rightmove appends a glossary after the description - council tax, parking,
@@ -452,7 +468,8 @@ def otm_detail(html: str, text: str = ""):
 
 # --------------------------------------------------------------------------
 # OpenRent  -  DOM cards. bathrooms_min filters server-side but the card never
-# prints a bathroom count, so mark it verified-by-search instead of inventing one.
+# prints a bathroom count, so mark it verified-by-search instead of inventing
+# one. The DETAIL page does print it - openrent_detail reads it and wins.
 # --------------------------------------------------------------------------
 
 OPENRENT_JS = """() => [...document.querySelectorAll('a.pli.search-property-card')].map(e => ({
@@ -510,6 +527,28 @@ def openrent_detail(html: str, text: str = ""):
     m = re.search(r"Rent PCM\s*£?([\d,]+)", text, re.I)
     if m:
         info["price_pcm"] = int(m.group(1).replace(",", ""))
+    # The SEARCH CARD never prints a bathroom count - that is what
+    # `bathrooms_verified_by_search` stands in for - but the DETAIL page states
+    # it outright, in a three-line block under the title:
+    #
+    #     2 Bed Flat, Hopgood Tower, SE3
+    #     2 bedrooms
+    #     2 bathrooms
+    #     4 tenants max.
+    #
+    # Nothing read it, so all 399 tracked OpenRent listings carried bathrooms
+    # None and rendered as "2/?" while the page said 2. Anchored to a whole
+    # line: the description's own prose ("2 bathrooms (1 en-suite), modern
+    # kitchen") is a claim about the flat, not the portal's field, and the
+    # anchor is what keeps the two apart.
+    baths = re.search(r"^[ \t]*(\d+)[ \t]+bathrooms?[ \t]*$", text, re.I | re.M)
+    if baths:
+        info["bathrooms"] = int(baths.group(1))
+        # Only alongside a description: `parts` empty means the page came back
+        # blank and has to be retried, and an evidence line on its own would
+        # look like a successful read of a page that rendered nothing.
+        if parts:
+            parts.append("Bathrooms: %d" % info["bathrooms"])
     # This used to be its own regex over a 20-character window, which captured
     # "to move in", "Today" and "to move in from 31 A" - 106 records carrying a
     # value that looked like data and that parse_date read as nothing at all.
@@ -643,7 +682,7 @@ def _one_date(value: str, today):
 # a listing was added, and when it becomes available. Both are worth having -
 # the first because paging a backlog we already track is pure waste, the second
 # because a portal that will FILTER on availability tells us the date even when
-# it refuses to PRINT it, exactly like OpenRent's bathrooms.
+# it refuses to PRINT it, exactly like OpenRent's bathrooms on the search card.
 #
 # Measured 2026-09-20 on the live 2-bed / <=4500 London search, off each
 # portal's own total - Zoopla's [data-testid="total-results"], Rightmove's

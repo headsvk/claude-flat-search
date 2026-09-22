@@ -300,7 +300,14 @@ Flag, never hide: no stated size, no stated bathroom count, an unchecked A/C ver
 **Unknown never rejects** — an unstated size, district, bathroom count, lift or A/C is
 recorded and flagged, never treated as absence. This has regressed three times.
 
-A size read off a floorplan by OCR is marked `*` and never hard-rejects.
+A size read off a floorplan by OCR is marked `*` and never hard-rejects. The
+**floor** read off the same plan does hard-reject: a misread digit turns 814
+into 314, but "Lower Ground Floor" does not misread into a different storey.
+Keeping that promise about the size needs care in both directions — the
+evidence line `fetch` writes into the cached page states a square footage in
+plain English, and until 2026-09-22 the size scan read it straight back as a
+size the portal had stated, which put an OCR'd number in front of the hard
+filter. 40 of the 41 records holding a plan area held it as `size_sqft`.
 
 **A bathroom count the row does not state stays unstated in the digest.** A `2/?`
 row written up as "2/2" invents the second bathroom, on the one hard requirement

@@ -53,6 +53,118 @@ class TestFindHeading(unittest.TestCase):
         self.assertEqual(portals._find_heading("location\nfoo", "location", 0), 0)
 
 
+# ---------------------------------------------------------------------------
+# Bot challenges. The one that went unnoticed for five days.
+# ---------------------------------------------------------------------------
+
+# A live Zoopla challenge, 2026-09-22. The identifying words are SPLIT: "Just a
+# moment..." is the title and never appears in the body, while the body says
+# "Performing security verification", which the old pattern did not cover. The
+# fetch layer matched the body alone, so it recognised neither half, and the
+# challenge reached the extractor as a page with nothing on it.
+CHALLENGE_HTML = ('<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...'
+                  '</title><meta name="robots" content="noindex,nofollow"></head>'
+                  '<body><div class="main-content">...</div></body></html>')
+CHALLENGE_BODY = ("www.zoopla.co.uk\nPerforming security verification\n\n"
+                  "This website uses a security service to protect against malicious "
+                  "bots. This page is displayed while the website verifies you are "
+                  "not a bot.\n\nRay ID: a3f20ea2dd46a0d7\n"
+                  "Performance and Security by Cloudflare")
+
+REAL_HTML = "<html><head><title>Indescon Square, London E14 - Zoopla</title></head><body>x</body></html>"
+REAL_BODY = "Skip to main content Buy Rent House prices 3 bed flat to rent Indescon Square"
+
+
+class TestChallengeDetection(unittest.TestCase):
+    def test_the_live_zoopla_challenge(self):
+        self.assertTrue(portals.challenged(CHALLENGE_HTML, CHALLENGE_BODY))
+
+    def test_title_alone_is_enough(self):
+        """The body of a challenge can say nothing the pattern knows."""
+        self.assertTrue(portals.challenged(CHALLENGE_HTML, "loading"))
+
+    def test_body_alone_is_enough(self):
+        """And the title can be the site's own, if the check renders inline."""
+        self.assertTrue(portals.challenged(REAL_HTML, CHALLENGE_BODY))
+
+    def test_a_real_listing_is_not_a_challenge(self):
+        self.assertFalse(portals.challenged(REAL_HTML, REAL_BODY))
+
+    def test_a_listing_that_merely_says_the_words_late_on(self):
+        """The body check is windowed to the first 4000 characters so a flat
+        described as having 'access denied to the roof terrace' 20kB down does
+        not read as a block."""
+        body = REAL_BODY + (" filler" * 2000) + " access denied"
+        self.assertFalse(portals.challenged(REAL_HTML, body))
+
+    def test_missing_title_does_not_raise(self):
+        self.assertFalse(portals.challenged("", ""))
+        self.assertFalse(portals.challenged("<html><body>hi</body></html>", "hi"))
+
+
+# ---------------------------------------------------------------------------
+# OpenRent bathrooms. The card hides them; the detail page states them.
+# ---------------------------------------------------------------------------
+
+OPENRENT_PAGE = """About
+For Tenants
+Map
+ Favourite
+2 Bed Flat, Hopgood Tower, SE3
+2 bedrooms
+2 bathrooms
+4 tenants max.
+London
+Stunning Two bedroom, Two Bathroom apartment in Kidbrooke Village. I am glad to
+present the stunning 10th Floor apartment within a prestigious sought after
+development. The property benefits from a private residents gym, 24 hour
+concierge and bike storage, and is two minutes from Kidbrooke station.
+Read more
+Price & Bills
+Rent PCM	£2,600.00
+"""
+
+
+class TestOpenRentBathrooms(unittest.TestCase):
+    """Measured 2026-09-22: all 399 tracked OpenRent listings carried
+    `bathrooms` None and rendered as "2/?", because nothing read the count the
+    detail page prints under the title. Two of them were handed over as
+    "bathroom count unstated" when the page said 2."""
+
+    def test_detail_page_count_is_read(self):
+        _, info = portals.openrent_detail("", OPENRENT_PAGE)
+        self.assertEqual(info.get("bathrooms"), 2)
+
+    def test_count_is_recorded_as_evidence_in_the_cached_text(self):
+        """The cache holds the extracted parts, not the page - a count that
+        never reaches `parts` cannot be re-read later without a re-fetch."""
+        parts, _ = portals.openrent_detail("", OPENRENT_PAGE)
+        self.assertIn("Bathrooms: 2", "\n".join(parts))
+
+    def test_description_prose_alone_does_not_count(self):
+        """'2 bathrooms (1 en-suite)' mid-sentence is the agent's claim about
+        the flat, not the portal's field. Only a whole line is the field."""
+        text = ("2 tenants max.\n"
+                "A stylish flat, recently refurbished. 2 bathrooms (1 en-suite), "
+                "modern kitchen, built in storage, utility room, open reception "
+                "room and a resident porter. Rent includes water.\n"
+                "Price & Bills\n")
+        _, info = portals.openrent_detail("", text)
+        self.assertIsNone(info.get("bathrooms"))
+
+    def test_blank_page_stays_blank(self):
+        """`parts` empty is the signal to retry a page that rendered nothing.
+        An evidence line on its own would read as a successful fetch."""
+        parts, info = portals.openrent_detail("", "2 bedrooms\n2 bathrooms\n")
+        self.assertEqual(parts, [])
+        self.assertEqual(info.get("bathrooms"), 2)
+
+    def test_one_bathroom_singular(self):
+        page = OPENRENT_PAGE.replace("2 bathrooms", "1 bathroom")
+        _, info = portals.openrent_detail("", page)
+        self.assertEqual(info.get("bathrooms"), 1)
+
+
 class TestSliceBetween(unittest.TestCase):
     def test_openrent_boilerplate_does_not_truncate(self):
         """The regression that lost 22% of OpenRent: the description must
