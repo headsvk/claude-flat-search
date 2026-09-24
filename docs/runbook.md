@@ -137,9 +137,20 @@ per-host miss rate printed by `flat-search details` is what actually covers that
 
     flat-search details
 
-`flat-search details` skips anything already tracked. `--refresh` re-queues tracked
-listings, which is also how you clear a backlog: only UNCACHED ones are actually
-fetched, so it lands exactly on those still missing a detail page.
+`flat-search details` fetches every listing it has not read yet. There is no cap,
+so a big morning - after a skipped day, say - is a long one rather than a lossy
+one. If a run is killed part-way, nothing is committed, and every page it did
+fetch stays cached, so the next run carries on from there.
+
+It skips anything already tracked, and **tracked means read**: `commit` keeps a
+listing whose page did not load out of the tracker, in state `pending`, and the
+next `details` queues it again from the search row it was found with (`retrying:
+N` in the plan output) - even once it has aged out of the search window. After 7
+days of that it goes in unread and flagged, so a page that never loads cannot
+hide a listing for ever. There is no backlog to clear by hand.
+
+`--refresh` re-queues tracked listings from today's search, for re-reading pages
+deliberately. It cannot reach a listing today's search did not return.
 
 Watch the per-host FAIL rate. A host losing a noticeable share of its fetches is
 this project's characteristic bug, not noise.
@@ -249,12 +260,12 @@ Re-read the rule at the top of step 1 before running this.
     flat-search render
     flat-search report
 
-render holds back any live listing whose detail page has not been read yet, and
-prints how many. They are not lost — they appear, complete, in a later day's file.
-This exists because a listing appears in exactly ONE daily file ever, so reporting an
-unread one spends its single appearance on a stub with no size, floor, lift or A/C.
-A listing held 7 days is released anyway, flagged, so a permanently failing fetch
-cannot hide it forever.
+A listing appears in exactly ONE daily file ever, so reporting an unread one spends
+its single appearance on a stub with no size, floor, lift or A/C. Unread listings
+therefore wait - in `pending`, or, for records from before that existed, held back
+by render - and the daily file says how many are waiting. They are not lost: they
+appear, complete, in a later day's file, or after 7 days flagged as unread.
+`report` prints `N listing(s) not tracked yet` for the pending ones.
 
 `report` splits every tally into live and ruled-out, and says which kind of unchecked
 it is looking at:

@@ -53,7 +53,7 @@ class TestRunStopsForJudgement(unittest.TestCase):
 
         self.args = argparse.Namespace(
             config=write_config(self.tmp.name, MINIMAL_TOML),
-            incremental=False, refresh=False, cap=None, host=None)
+            incremental=False, refresh=False, host=None)
 
     def run_cmd(self):
         with contextlib.redirect_stdout(io.StringIO()):

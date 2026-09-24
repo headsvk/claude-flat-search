@@ -4,8 +4,8 @@ The rule that makes the daily file work is that a listing appears in exactly ONE
 of them, ever. That rule is only safe if a listing is reported when it is
 COMPLETE, because its single appearance cannot be spent twice.
 
-STAGE2_CAP breaks the pairing: a busy morning commits far more listings than it
-fetches details for. Measured 2026-09-19, 142 of 179 went into the daily file as
+The old 150-page fetch cap broke the pairing: a busy morning committed far more
+listings than it fetched details for. Measured 2026-09-19, 142 of 179 went into the daily file as
 stubs - no size, floor, lift or A/C - and were stamped, so the filled-in versions
 could never be shown. These tests pin down the fix and its escape hatch.
 """

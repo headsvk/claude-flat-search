@@ -66,7 +66,7 @@ def stage_audit(cfg, stage1: pathlib.Path) -> None:
 
 def stage_details(cfg, stage1: pathlib.Path, args) -> None:
     queue = cfg.runs_dir / "queue.json"
-    core.plan(cfg, stage1, queue, cap=args.cap, refresh=args.refresh)
+    core.plan(cfg, stage1, queue, refresh=args.refresh)
     asyncio.run(fetch_mod.run_details(cfg, queue, stage1, host=args.host))
 
 
@@ -234,7 +234,6 @@ def cmd_check(args) -> int:
     else:
         print("move-in     : any (no date set - timing is not ranked on)")
     print("aircon      : %s" % cfg.aircon)
-    print("cap         : %d detail pages per run" % cfg.stage2_cap)
 
     # Say what the NEXT run would ask each portal for, not just what the config
     # says, because the recency window is computed from the gap since the last
@@ -274,7 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add(name, fn, help_):
         s = sub.add_parser(name, help=help_)
-        s.set_defaults(fn=fn, incremental=False, refresh=False, host=None, cap=None)
+        s.set_defaults(fn=fn, incremental=False, refresh=False, host=None)
         return s
 
     r = add("run", cmd_run, "the whole pipeline, in the only safe order")
@@ -282,9 +281,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="stop each newest-first portal once it serves listings "
                         "already tracked")
     r.add_argument("--refresh", action="store_true",
-                   help="re-queue already-tracked listings; also how you clear a "
-                        "backlog, since only uncached ones are fetched")
-    r.add_argument("--cap", type=int, help="override stage2_cap for this run")
+                   help="re-queue already-tracked listings from today's search, "
+                        "to re-read their pages deliberately")
 
     f = add("finish", cmd_finish, "commit and render after a model judged the flagged listings")
     f.add_argument("--refresh", action="store_true", help="pairs with run --refresh")
@@ -296,7 +294,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = add("details", cmd_details, "stage 2 only: plan a queue and fetch detail pages")
     d.add_argument("--refresh", action="store_true")
-    d.add_argument("--cap", type=int)
     d.add_argument("--host", help="fetch only this portal, e.g. openrent")
 
     add("judge", cmd_judge, "decide A/C; flag the ones needing a model")

@@ -79,6 +79,53 @@ def write_json(path: pathlib.Path, payload) -> None:
 # workbook
 # --------------------------------------------------------------------------
 
+# How long a listing whose detail page will not load waits before it goes into
+# the tracker unread anyway. Without an end, a page that always fails would be
+# retried for ever and never shown - the loss this exists to prevent, moved.
+HOLD_DAYS = 7
+
+
+def pending_rows(cfg, listings: list, known: set) -> list:
+    """Search rows for pending listings that today's search did not return."""
+    if not cfg.state_path.exists():
+        return []
+    pending = read_json(cfg.state_path).get("pending") or {}
+    present = {str(l.get("url", "")).strip() for l in listings}
+    return [dict(p.get("row") or {}, url=url, retry=True)
+            for url, p in sorted(pending.items())
+            if url not in present and url not in known]
+
+
+def park_unread(pending: dict, url: str, listing: dict, run_date: str) -> bool:
+    """Keep a listing whose detail page has not been read OUT of the tracker.
+
+    Tracked means read. A listing tracked unread is skipped by every later
+    run's fetch, because the fetch skips tracked listings, so it is never read
+    at all - that is how 139 listings sat unread on 2026-09-25. Parked here it
+    stays untracked, and `plan` queues it again next run.
+
+    -> True while it should keep waiting; False once it has waited HOLD_DAYS
+    and goes into the tracker unread, to be released flagged.
+    """
+    p = pending.get(url) or {"first_seen": run_date, "attempts": 0}
+    # One attempt per run day: `finish` re-commits the same morning, and
+    # counting that as a second failed fetch would overstate it.
+    if p.get("last_tried") != run_date:
+        p["attempts"] = int(p.get("attempts") or 0) + 1
+        p["last_tried"] = run_date
+    if not listing.get("retry"):
+        # Seen in today's search: the freshest row, and a real sighting.
+        p["last_seen"] = run_date
+        p["row"] = {k: v for k, v in listing.items() if k != "retry"}
+    pending[url] = p
+    try:
+        waited = (dt.date.fromisoformat(str(run_date)[:10])
+                  - dt.date.fromisoformat(str(p["first_seen"])[:10])).days
+    except ValueError:
+        waited = 0
+    return waited < HOLD_DAYS
+
+
 def known_urls(cfg: dict) -> set:
     """Every URL already in state.json - the incremental-search stop set."""
     path = cfg.state_path
@@ -381,11 +428,31 @@ def validate_verdict(url: str, raw: dict | None, cache_dir: pathlib.Path) -> dic
 # commands
 # --------------------------------------------------------------------------
 
-def plan(cfg, stage1_path, out_path, cap=None, refresh=False):
+def plan(cfg, stage1_path, out_path, refresh=False):
+    """Queue every listing whose detail page this run should read.
+
+    There is no cap. There was one - 150 pages - and past it listings were
+    tracked without ever being read, then skipped by every later run because
+    they were tracked. When the daily intake rose to ~200 (2026-09-22, the
+    portal availability filter came out) that parked 50-70 listings a day where
+    nothing would go back for them. A long morning is the cost of having no
+    cap; a silently lost listing was the cost of having one.
+
+    Listings whose page did not load on an earlier run are in state `pending`,
+    not tracked, and are re-queued here from the search row they were found
+    with - including after they have aged out of today's search window.
+    """
     stage1_path, out_path = pathlib.Path(stage1_path), pathlib.Path(out_path)
     stage1 = read_json(stage1_path)
     listings = stage1.get("listings", stage1 if isinstance(stage1, list) else [])
     known = known_urls(cfg)
+    retried = pending_rows(cfg, listings, known)
+    if retried and isinstance(stage1, dict):
+        # Into stage1 itself, not just the queue: fetch enriches the row it
+        # finds there and commit reads rows from there, so a listing only in
+        # the queue would be fetched and then never recorded.
+        stage1.setdefault("listings", listings).extend(retried)
+        write_json(stage1_path, stage1)
     cache_dir = cfg.cache_dir
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -418,19 +485,12 @@ def plan(cfg, stage1_path, out_path, cap=None, refresh=False):
         })
 
     queue.sort(key=lambda q: (q["already_cached"], q["tier"]))
-    cap = cap if cap is not None else cfg.stage2_cap
-    uncached = [q for q in queue if not q["already_cached"]]
-    to_fetch = uncached[:cap]
-    deferred = uncached[cap:]
-    for q in deferred:
-        q["deferred"] = True
+    to_fetch = [q for q in queue if not q["already_cached"]]
 
     payload = {
         "generated": dt.datetime.now().isoformat(timespec="seconds"),
-        "cap": cap,
         "fetch": to_fetch,
         "cached": [q for q in queue if q["already_cached"]],
-        "deferred": deferred,
         "skipped_duplicates": len(dupes),
         "rejected": rejected,
     }
@@ -445,9 +505,11 @@ def plan(cfg, stage1_path, out_path, cap=None, refresh=False):
     print("hard-filtered out   : " + str(len(rejected)))
     for r in rejected[:8]:
         print("   - " + r["reason"] + ": " + str(r["title"] or r["url"])[:60])
+    if retried:
+        print("retrying            : " + str(len(retried)) +
+              " listing(s) whose detail page did not load on an earlier run")
     print("already cached      : " + str(len(payload["cached"])) + " (no refetch needed)")
-    print("TO FETCH            : " + str(len(to_fetch)) + "  (cap " + str(cap) + ")")
-    print("deferred to next run: " + str(len(deferred)))
+    print("TO FETCH            : " + str(len(to_fetch)))
     print("\nqueue -> " + str(out_path))
     return payload
 
@@ -605,10 +667,12 @@ def commit(cfg, stage1_path, verdicts_path=None, update=False):
 
     state = load_state(cfg)
     by_url = {str(l.get("url", "")).strip(): l for l in state["listings"]}
+    pending = state.setdefault("pending", {})
     cache_dir = cfg.cache_dir
     run_date = stage1.get("run_date") or today()
 
     added = updated = 0
+    parked, released = 0, []
     rejected_late, flags, ac_counts, seen = [], [], {}, set()
 
     for listing in listings:
@@ -617,9 +681,13 @@ def commit(cfg, stage1_path, verdicts_path=None, update=False):
             continue
         seen.add(url)
         existing = by_url.get(url)
+        if existing:
+            # Tracked is read; a pending entry for it is stale.
+            pending.pop(url, None)
 
         reason = hard_filter(listing, cfg)
         if reason:
+            pending.pop(url, None)
             # A listing already tracked can fail later, once its detail page has
             # been read - a basement flat, or a stated size under the floor. Say
             # so on the record rather than leaving it looking untriaged. One not
@@ -640,6 +708,15 @@ def commit(cfg, stage1_path, verdicts_path=None, update=False):
                 rejected_late.append(str(listing.get("title") or url)[:44] + ": " + reason)
             continue
 
+        unread_note = None
+        if not existing and not (cache_dir / cache_name(url)).exists():
+            if park_unread(pending, url, listing, run_date):
+                parked += 1
+                continue
+            unread_note = ("detail page never loaded (%d attempts) - unread"
+                           % pending[url]["attempts"])
+            released.append(str(listing.get("title") or url)[:60])
+
         ac = validate_verdict(url, verdicts.get(url), cache_dir)
         if not update:
             ac = carry_verdict(ac, existing)
@@ -654,6 +731,8 @@ def commit(cfg, stage1_path, verdicts_path=None, update=False):
         notes += ac_notes
         if listing.get("notes"):
             notes.insert(0, str(listing["notes"]))
+        if unread_note:
+            notes.append(unread_note)
         if listing.get("size_sqft_plan") and not listing.get("size_sqft"):
             notes.append("size %d sq ft read off the floorplan%s - verify"
                          % (listing["size_sqft_plan"],
@@ -699,9 +778,14 @@ def commit(cfg, stage1_path, verdicts_path=None, update=False):
             existing["last_seen"] = run_date
             updated += 1
         else:
+            # A listing that waited in `pending` keeps the day it was first
+            # found, and - if it came back only as a retry, not from today's
+            # search - the day it was last actually seen.
+            pend = pending.pop(url, None) or {}
             record["status"] = "NEW"
-            record["found_on"] = run_date
-            record["last_seen"] = run_date
+            record["found_on"] = pend.get("first_seen") or run_date
+            record["last_seen"] = (pend.get("last_seen") or run_date
+                                   if listing.get("retry") else run_date)
             record["reported_on"] = None
             state["listings"].append(record)
             by_url[url] = record
@@ -710,6 +794,14 @@ def commit(cfg, stage1_path, verdicts_path=None, update=False):
     save_state(cfg, state)
     print("state: " + str(cfg.state_path))
     print("added %d, updated %d, tracked total %d" % (added, updated, len(state["listings"])))
+    if parked:
+        print("NOT TRACKED YET - %d listing(s) whose detail page has not loaded;"
+              " retried next run" % parked)
+    if released:
+        print("RELEASED UNREAD - %d listing(s) waited %d days for a detail page:"
+              % (len(released), HOLD_DAYS))
+        for r in released[:12]:
+            print("   ? " + r)
     ac_line = ", ".join(k + "=" + str(v) for k, v in sorted(ac_counts.items()))
     print("A/C verdicts: " + (ac_line or "none"))
     if rejected_late:
@@ -893,3 +985,7 @@ def report(cfg):
     unseen = sum(1 for l in live if not l.get("reported_on"))
     if unseen:
         print("  %d live listing(s) not yet written to a daily file" % unseen)
+    waiting = len(state.get("pending") or {})
+    if waiting:
+        print("  %d listing(s) not tracked yet - detail page not loaded, retried "
+              "every run" % waiting)

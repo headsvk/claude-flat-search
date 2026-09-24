@@ -101,11 +101,6 @@ move_in_slack_days = 7
 
 
 [run]
-# How many detail pages one run fetches. Anything beyond waits for the next
-# run and is held OUT of the daily file until its details exist, so it is
-# never reported as a stub.
-stage2_cap = 150
-
 # Everything a run writes - state, cache, daily files, logs - lives here.
 # Relative paths resolve against this file. Keeps the repo source-only.
 data_dir = "data"

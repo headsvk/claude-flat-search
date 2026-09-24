@@ -57,10 +57,18 @@ SCHEMA: dict[str, dict[str, tuple]] = {
         "move_in_slack_days": (int, 7),
     },
     "run": {
-        "stage2_cap": (int, 150),
         "data_dir": (str, "data"),
         "first_run_days": (int, 14),
     },
+}
+
+
+# Keys that used to exist. Named rather than left to the unknown-key error, so
+# an old config says what to do instead of only that it is wrong.
+REMOVED = {
+    ("run", "stage2_cap"): "the detail fetch is no longer capped - delete the "
+                           "line. Past the cap, listings were tracked unread "
+                           "and never fetched again.",
 }
 
 
@@ -92,7 +100,6 @@ class Config:
     move_in: str
     move_in_slack_days: int
 
-    stage2_cap: int
     first_run_days: int
     searches: tuple
 
@@ -200,6 +207,10 @@ def load(path: str | pathlib.Path | None = None) -> Config:
         block = raw.get(section, {})
         if not isinstance(block, dict):
             raise ConfigError("[%s] must be a table" % section)
+        for key in block:
+            if (section, key) in REMOVED:
+                raise ConfigError("[%s] %s has been removed: %s"
+                                  % (section, key, REMOVED[(section, key)]))
         unknown = set(block) - set(keys)
         if unknown:
             raise ConfigError(
@@ -289,7 +300,6 @@ def load(path: str | pathlib.Path | None = None) -> Config:
         fringe_districts=_districts(values["districts.fringe"], "districts", "fringe"),
         move_in=move_in,
         move_in_slack_days=values["dates.move_in_slack_days"],
-        stage2_cap=values["run.stage2_cap"],
         first_run_days=values["run.first_run_days"],
         searches=_searches(raw.get("searches", {})),
     )

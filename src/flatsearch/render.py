@@ -218,7 +218,7 @@ def order(rows: list) -> list:
 is_live = core.is_live
 
 
-HOLD_DAYS = 7
+HOLD_DAYS = core.HOLD_DAYS
 
 
 def overdue(listing: dict, day: str) -> bool:
@@ -254,16 +254,19 @@ def render_daily(state: dict, decisions: dict, day: str) -> tuple:
     listings = state.get("listings", [])
     apply_decisions(listings, decisions)
 
-    # Hold back a listing whose detail page has not been read yet. STAGE2_CAP
-    # bounds how many details one run fetches, so a big morning commits far more
-    # listings than it reads - and a listing appears in exactly ONE daily file,
-    # ever. Reporting an unread one spends its single appearance on a stub with
-    # no size, floor, lift or A/C, and the filled-in version is never shown.
-    # Measured 2026-09-19: 142 of 179 went out like that. They wait instead.
+    # Hold back a listing whose detail page has not been read yet. A listing
+    # appears in exactly ONE daily file, ever, so reporting an unread one spends
+    # its single appearance on a stub with no size, floor, lift or A/C, and the
+    # filled-in version is never shown. Measured 2026-09-19: 142 of 179 went
+    # out like that. `commit` now keeps unread listings out of the tracker
+    # altogether (state `pending`), so this catches only records from before
+    # that, and the ones released unread after HOLD_DAYS.
     fresh = [l for l in listings if not l.get("reported_on")]
     held = [l for l in fresh
             if is_live(l) and not l.get("aircon_checked") and not overdue(l, day)]
     fresh = [l for l in fresh if l not in held]
+    # Not tracked yet, but found, and they will turn up: counted with the held.
+    waiting = len(held) + len(state.get("pending") or {})
 
     # Re-running a day must reproduce that day, not blank it: everything already
     # stamped with this date belongs in this file too. Without this, generating
@@ -278,9 +281,9 @@ def render_daily(state: dict, decisions: dict, day: str) -> tuple:
     out = ["# New listings — %s" % day, ""]
     if not live and not dead:
         out += ["Nothing new today.", ""]
-        if held:
-            out += ["%d listing(s) found today are waiting on a detail page and "
-                    "will appear once it is read." % len(held), ""]
+        if waiting:
+            out += ["%d listing(s) are waiting on a detail page and will appear "
+                    "once it is read." % waiting, ""]
         return '\n'.join(out), [], held, 0
 
     out += ["**%d new**%s · %d with A/C in unit · %d ruled out before you saw them"
@@ -289,9 +292,9 @@ def render_daily(state: dict, decisions: dict, day: str) -> tuple:
                len(ac), len(dead)), "",
             "Sizes marked `*` were read off a floorplan by OCR, not stated by the agent.",
             "Record any call in `decisions.md`. Earlier days are in this folder.", ""]
-    if held:
-        out += ["_%d more found today are waiting on a detail page. They will appear "
-                "in a later file, complete, rather than as a stub here._" % len(held), ""]
+    if waiting:
+        out += ["_%d more are waiting on a detail page. They will appear in a later "
+                "file, complete, rather than as a stub here._" % waiting, ""]
 
     for tier in ("High", "Medium", "Low"):
         rows = [l for l in live if str(l.get("priority")) == tier]
