@@ -71,12 +71,20 @@ class TestLiveAndRuledOutAreSeparate(ReportCase):
         self.assertNotIn("nothing to fetch", out)
 
     def test_the_aircon_tally_is_split(self):
-        self.write([listing(aircon="yes")] +
+        self.write([listing(aircon="yes", aircon_scope="in_unit")] +
                    [listing(status="REJECTED", aircon="unchecked")])
         out = self.report()
         line = next(l for l in out.splitlines() if "aircon" in l and "live" in l)
         self.assertIn("yes=1", line)
         self.assertNotIn("unchecked", line)
+
+    def test_communal_cooling_is_not_tallied_as_a_yes(self):
+        self.write([listing(aircon="yes", aircon_scope="in_unit"),
+                    listing(aircon="yes", aircon_scope="communal_only")])
+        out = self.report()
+        line = next(l for l in out.splitlines() if "aircon" in l and "live" in l)
+        self.assertIn("yes=1", line)
+        self.assertIn("yes-communal_only=1", line)
 
     def test_a_tracker_with_nothing_ruled_out_prints_no_empty_half(self):
         """The split is there to answer a question, not to double the output."""
@@ -124,8 +132,18 @@ class TestBaselineDeltas(ReportCase):
     def test_newly_confirmed_aircon_shows_up(self):
         self.write([listing(aircon="unchecked")])
         core.write_baseline(self.cfg)
-        self.write([listing(aircon="yes")])
+        self.write([listing(aircon="yes", aircon_scope="in_unit")])
         self.assertIn("+1 A/C in unit", self.report())
+
+    def test_communal_cooling_does_not_move_the_in_unit_delta(self):
+        """2026-09-25 said +2 A/C in unit; one of them was the gym."""
+        self.write([listing(aircon="unchecked"), listing(aircon="unchecked")])
+        core.write_baseline(self.cfg)
+        self.write([listing(aircon="yes", aircon_scope="in_unit"),
+                    listing(aircon="yes", aircon_scope="communal_only")])
+        out = self.report()
+        self.assertIn("+1 A/C in unit", out)
+        self.assertNotIn("+2 A/C in unit", out)
 
     def test_an_unchanged_run_says_so_rather_than_printing_zeroes(self):
         self.write([listing()])

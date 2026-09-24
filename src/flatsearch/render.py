@@ -72,8 +72,12 @@ def size_cell(listing: dict) -> str:
 
 def flags(listing: dict) -> str:
     out = []
-    if listing.get("aircon") == "yes":
+    if core.aircon_in_unit(listing):
         out.append("**A/C**")
+    elif listing.get("aircon") in ("yes", "likely"):
+        out.append("A/C communal only"
+                   if listing.get("aircon_scope") == "communal_only"
+                   else "A/C, not clearly in the unit")
     if listing.get("concierge"):
         out.append("concierge")
     if listing.get("lift"):
@@ -204,7 +208,7 @@ def table(rows: list, buildings: dict | None = None) -> list:
 
 def order(rows: list) -> list:
     return sorted(rows, key=lambda l: (RANK.get(str(l.get("priority")), 3),
-                                       0 if l.get("aircon") == "yes" else 1,
+                                       0 if core.aircon_in_unit(l) else 1,
                                        l.get("price_pcm") or 10 ** 9))
 
 
@@ -268,7 +272,7 @@ def render_daily(state: dict, decisions: dict, day: str) -> tuple:
     live = order([l for l in todays if is_live(l)])
     dead = [l for l in todays if not is_live(l)]
 
-    ac = [l for l in live if l.get("aircon") == "yes"]
+    ac = [l for l in live if core.aircon_in_unit(l)]
     buildings = building_counts(listings)
     distinct = len(group_dupes(live))
     out = ["# New listings — %s" % day, ""]
@@ -343,7 +347,7 @@ def render(state: dict, decisions: dict, limit_low: int = 60) -> str:
     today = dt.date.today().isoformat()
     buildings = building_counts(listings)
     distinct = len(group_dupes(live))
-    ac = sum(1 for l in live if l.get("aircon") == "yes")
+    ac = sum(1 for l in live if core.aircon_in_unit(l))
     out = ["# Flat shortlist", "",
            "%s · **%d live**%s · %d with A/C in unit · %d ruled out"
            % (today, len(live),

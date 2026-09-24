@@ -733,10 +733,30 @@ def is_live(listing: dict) -> bool:
     return str(listing.get("status", "")).upper() not in DEAD_STATUSES
 
 
-def tally(rows: list, field: str) -> dict:
+def aircon_in_unit(listing: dict) -> bool:
+    """The same hit `apply_aircon` ranks on, read off a stored record.
+
+    Everything that showed or counted A/C tested the verdict alone, so a
+    `communal_only` yes - cooling in the residents' gym - was bolded **A/C**
+    and counted "in unit" while being ranked, correctly, as though it were not.
+    The first one landed 2026-09-25 and put 2 in a headline that had 1.
+    """
+    return (listing.get("aircon") in ("yes", "likely")
+            and listing.get("aircon_scope") == "in_unit")
+
+
+def aircon_label(listing: dict) -> str:
+    """The A/C tally key: a yes that is not in the unit says which kind it is."""
+    verdict = listing.get("aircon") or "(blank)"
+    if verdict in ("yes", "likely") and not aircon_in_unit(listing):
+        return "%s-%s" % (verdict, listing.get("aircon_scope") or "unclear")
+    return verdict
+
+
+def tally(rows: list, field) -> dict:
     out: dict = {}
     for l in rows:
-        key = l.get(field) or "(blank)"
+        key = (field(l) if callable(field) else l.get(field)) or "(blank)"
         out[key] = out.get(key, 0) + 1
     return out
 
@@ -764,6 +784,7 @@ def snapshot(cfg) -> dict:
         "live": len(live),
         "ruled_out": len(dead),
         "aircon_live": tally(live, "aircon"),
+        "aircon_in_unit": sum(1 for l in live if aircon_in_unit(l)),
         "unreported": sum(1 for l in live if not l.get("reported_on")),
     }
 
@@ -818,8 +839,12 @@ def report(cfg):
             _delta("tracked", base.get("tracked"), len(listings)),
             _delta("live", base.get("live"), len(live)),
             _delta("ruled out", base.get("ruled_out"), len(dead)),
-            _delta("A/C in unit", (base.get("aircon_live") or {}).get("yes"),
-                   tally(live, "aircon").get("yes")),
+            # A baseline written before `aircon_in_unit` existed only has the
+            # raw tally; its yes count is the closest thing it recorded.
+            _delta("A/C in unit",
+                   base.get("aircon_in_unit",
+                            (base.get("aircon_live") or {}).get("yes")),
+                   sum(1 for l in live if aircon_in_unit(l))),
             _delta("awaiting a daily file", base.get("unreported"),
                    sum(1 for l in live if not l.get("reported_on"))),
         ) if p]
@@ -848,12 +873,12 @@ def report(cfg):
     # belonged to a listing the hard filter had already thrown out before its
     # detail page was ever fetched, but the line could not say so, and the
     # reason had to be dug out of state.json by hand.
-    for field in ("priority", "aircon"):
+    for field, key in (("priority", "priority"), ("aircon", aircon_label)):
         if live:
-            print("  %-9s live      %s" % (field, _counts(tally(live, field))))
+            print("  %-9s live      %s" % (field, _counts(tally(live, key))))
         if dead:
             print("  %-9s ruled out %s" % (field if not live else "",
-                                           _counts(tally(dead, field))))
+                                           _counts(tally(dead, key))))
     if listings:
         print("  %-9s %s" % ("status", _counts(tally(listings, "status"))))
 

@@ -129,5 +129,26 @@ class TestRerunSameDay(unittest.TestCase):
         self.assertEqual(daily([row])["shown"], 0)
 
 
+class TestAirconScope(unittest.TestCase):
+    """Only cooling in the flat itself is A/C. The residents' gym is not."""
+
+    def rows(self):
+        return [listing(url="https://www.example.com/unit", aircon="yes",
+                        aircon_scope="in_unit", aircon_checked="2026-09-25"),
+                listing(url="https://www.example.com/gym", aircon="yes",
+                        aircon_scope="communal_only", aircon_checked="2026-09-25",
+                        area="E1", price_pcm=3100)]
+
+    def test_the_headline_counts_only_in_unit(self):
+        text = daily(self.rows(), day="2026-09-25")["text"]
+        self.assertIn("1 with A/C in unit", text)
+
+    def test_communal_cooling_is_not_bolded_as_ac(self):
+        self.assertEqual(render.flags(self.rows()[0]).count("**A/C**"), 1)
+        flag = render.flags(self.rows()[1])
+        self.assertNotIn("**A/C**", flag)
+        self.assertIn("A/C communal only", flag)
+
+
 if __name__ == "__main__":
     unittest.main()
