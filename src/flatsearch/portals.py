@@ -217,14 +217,17 @@ def slice_between(text: str, starts, ends, minlen: int = 80):
 # --------------------------------------------------------------------------
 
 def rightmove_search(html: str, page):
+    """-> (rows, total). `total` is None when the page could not be read - a
+    challenge, a changed payload - and 0 only when Rightmove itself stated
+    zero results. `collect` relies on that difference; see STATES_ZERO."""
     m = re.search(r'id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
     if not m:
-        return [], 0
+        return [], None
     try:
         sr = json.loads(m.group(1))["props"]["pageProps"]["searchResults"]
         props = sr["properties"]
     except (KeyError, TypeError, json.JSONDecodeError):
-        return [], 0
+        return [], None
     out = []
     for p in props:
         addr = (p.get("displayAddress") or "").replace("\n", " ").strip()
@@ -240,7 +243,9 @@ def rightmove_search(html: str, page):
                          bed_count=p.get("bedrooms"), bathrooms=p.get("bathrooms"),
                          size_sqft=sqft(p.get("displaySize")),
                          contact=(p.get("customer") or {}).get("branchDisplayName")))
-    return out, int(str(sr.get("resultCount", "0")).replace(",", "") or 0)
+    count = sr.get("resultCount")
+    count = "" if count is None else str(count).replace(",", "")
+    return out, int(count) if count.isdigit() else None
 
 
 def rightmove_detail(html: str, text: str = ""):
@@ -769,10 +774,20 @@ PORTALS = [
 ]
 
 
+# Portals whose search extractor returns total=None for a page it could not
+# read, so that a total of 0 can only mean the portal said "0 results" on a
+# well-formed page. The others return 0 for both, and for them an empty first
+# page must stay a failure. Rightmove's is the only one verified: its
+# `resultCount` sits beside the results in the same payload, and a challenge
+# page carries no payload at all.
+STATES_ZERO = {"rightmove.co.uk"}
+
+
 def portal_for(url: str):
     for host, name, s, d, page_param, step, sorted_newest in PORTALS:
         if host in url:
             return {"host": host, "name": name, "search": s, "detail": d,
                     "page_param": page_param, "step": step,
-                    "sorted_newest": sorted_newest}
+                    "sorted_newest": sorted_newest,
+                    "states_zero": host in STATES_ZERO}
     return None

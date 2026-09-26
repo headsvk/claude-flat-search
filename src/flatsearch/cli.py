@@ -52,7 +52,8 @@ def stage_search(cfg, args) -> pathlib.Path:
             "A challenged search and a quiet morning look identical, so this run\n"
             "stops here rather than marking unseen listings as seen. Listings\n"
             "committed now would never appear in a daily file again.\n"
-            "Re-run the affected portal alone with --host, or try later.")
+            "Re-run `flat-search search` (it has no single-portal option;\n"
+            "--host is on `details` only), or try later.")
     return out
 
 
@@ -149,7 +150,7 @@ def cmd_finish(args) -> int:
 def cmd_search(args) -> int:
     cfg = _load(args)
     # `run` is the way in, and it takes the baseline itself. This is for the
-    # mornings that do not go that way: a portal re-run with `--host`, or
+    # mornings that do not go that way: a search re-run after a failure, or
     # stages driven by hand. Without it `report` has nothing to difference
     # against, and on 2026-09-21 that silence ended in a digest that worked
     # the deltas out by hand and called 18 old rejections new.

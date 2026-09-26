@@ -293,6 +293,46 @@ def scoped_searches(cfg) -> list:
     return out
 
 
+QUIET = "stated 0 in window"
+
+
+def empty_status(url: str, page_no: int, total, pt: dict) -> str:
+    """What an empty results page means.
+
+    Past page 0 it is the end of the results. ON page 0 it is a failure - a
+    challenge and a quiet morning look identical - unless all of this holds:
+    the portal's extractor can tell an unread page from a stated zero, it
+    stated zero, and the URL carries the recency window, so that zero is a
+    window with nothing new in it. That is QUIET, and it is still not trusted
+    on its own: the window fails CLOSED on a value the portal does not know,
+    also as a stated zero. `run_search` accepts QUIET only when another search
+    on the same portal, with the same window, returned listings this run.
+
+    Measured 2026-09-26: a Rightmove outcode search, scoped to 3 days, stated
+    resultCount=0 on a well-formed page and 15 without the window; as a plain
+    EMPTY it failed the whole morning's search.
+    """
+    if page_no:
+        return "ok"
+    spec = portals.window_for(url, portals.RECENT_WINDOWS)
+    windowed = bool(spec and re.search(r"[?&]%s=" % re.escape(spec[0]), url))
+    if total == 0 and pt.get("states_zero") and windowed:
+        return QUIET
+    return "EMPTY on page 0"
+
+
+def quiet_problems(host: str, quiet: int, host_rows: int) -> list:
+    """QUIET searches are clean only if the same window, on the same portal,
+    returned something this run. Every search on a portal is scoped with the
+    one window, so a sibling that found listings proves the value is one the
+    portal accepts; with no such sibling, a stated zero cannot be told from a
+    window value it rejected."""
+    if quiet and not host_rows:
+        return ["%s  %d search(es) stated 0 in the window and none returned "
+                "anything to vouch for it" % (host, quiet)]
+    return []
+
+
 async def collect(url: str, seen: set, known: set | None = None,
                   incremental: bool = False) -> tuple[list, str]:
     """One search URL, its own browser. Returns (new listings, status)."""
@@ -317,7 +357,7 @@ async def collect(url: str, seen: set, known: set | None = None,
             res = pt["search"](html, s.page)
             rows, total = (await res) if asyncio.iscoroutine(res) else res
         if not rows:
-            return found, ("EMPTY on page %d" % page_no) if page_no == 0 else "ok"
+            return found, empty_status(url, page_no, total, pt)
 
         page_urls = {r["url"] for r in rows if r.get("url")}
         # Pagination advance is judged PER SEARCH, not against the global dedup
@@ -380,7 +420,7 @@ async def run_search(cfg, out_path, incremental: bool = False) -> bool:
 
     async def run_host(host, host_urls):
         """One browser per portal, its URLs in order - unchanged behaviour."""
-        seen, rows_all, problems, log = set(), [], [], []
+        seen, rows_all, problems, log, quiet = set(), [], [], [], 0
         for url in host_urls:
             try:
                 rows, status = await collect(url, seen, known, incremental)
@@ -388,11 +428,14 @@ async def run_search(cfg, out_path, incremental: bool = False) -> bool:
                 problems.append("%s  %s" % (host, str(exc)[:90]))
                 log.append("  !! %-22s %s" % (host, str(exc)[:90]))
                 continue
-            if status != "ok":
+            if status == QUIET:
+                quiet += 1
+            elif status != "ok":
                 problems.append("%s  %s" % (host, status))
             rows_all += rows
             log.append("  %-22s +%-4d %s" % (host, len(rows), status))
             await asyncio.sleep(random.uniform(3, 6))
+        problems += quiet_problems(host, quiet, len(rows_all))
         print("  done %-20s %d listings" % (host, len(rows_all)), flush=True)
         return rows_all, problems, log
 
@@ -531,6 +574,19 @@ async def enrich_detail(session, pt, url, html, text, parts, info, row, cfg):
             info.setdefault(k, v)
 
 
+def has_prose(parts) -> bool:
+    """Did the page yield the advert itself, not just facts derived around it?
+
+    The empty-page guard used to ask only whether ANY part came back. Since the
+    availability date is also read from the page text, a Zoopla stub - the
+    blanked page it serves after the first listing in a session - can extract
+    to nothing but "Availability: ...", which passed as a fetched page. One did
+    on 2026-09-25: cached at 24 chars, committed as read, and reported with no
+    description; the audit's `has desc` column caught it the next morning.
+    """
+    return any(p.startswith(("Description: ", "Key features: ")) for p in parts)
+
+
 async def run_details(cfg, queue_path, stage1_path, host=None):
     await preflight(cfg)
     queue = core.read_json(pathlib.Path(queue_path))
@@ -581,7 +637,7 @@ async def run_details(cfg, queue_path, stage1_path, host=None):
                     await enrich_detail(s, pt, it["url"], html, text,
                                         parts, info, by_url.get(it["url"]), cfg)
                     text = "\n".join(parts)
-                    if not text.strip():
+                    if not has_prose(parts):
                         # A page that rendered nothing. Until 2026-09-22 this also
                         # silently absorbed every Zoopla bot challenge, because the
                         # challenge was not recognised and extracted to nothing -
@@ -624,7 +680,7 @@ async def run_details(cfg, queue_path, stage1_path, host=None):
                     await enrich_detail(s2, pt, it["url"], html, text,
                                         parts, info, by_url.get(it["url"]), cfg)
                     text = chr(10).join(parts)
-                    if text.strip():
+                    if has_prose(parts):
                         core.write_json(pathlib.Path(it["cache_path"]),
                                         {"url": it["url"], "fetched_at": core.today(),
                                          "source": pt["name"].lower() + "-detail",

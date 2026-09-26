@@ -105,8 +105,15 @@ empty page. If it exits non-zero:
     this morning would have its listings marked seen without ever being shown, and
     they would never appear in a daily file again.
   - You may still commit if the failure is confined to one portal AND re-running
-    that portal alone with `--host <hostname>` succeeds. Otherwise stop after
-    reporting.
+    `flat-search search` comes back clean. `search` has no single-portal option;
+    `--host` exists on `details` only. Otherwise stop after reporting.
+
+A windowed Rightmove search that finds nothing new is NOT a problem: the log line
+reads `stated 0 in window`. That is accepted only because Rightmove states its
+count on a well-formed page, and only when another Rightmove search in the same
+run returned listings — the window fails closed on a value it does not know, also
+as a stated zero. The other portals cannot tell the two apart, so an empty first
+page from them is still a failure.
 
 A clean run prints `N unique listings` and a per-platform breakdown with no PROBLEMS
 block. Zero new listings after a clean search is a normal quiet morning — report it

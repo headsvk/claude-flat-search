@@ -394,6 +394,84 @@ class TestOtmSearchTotal(unittest.TestCase):
         self.assertEqual(total, 1)
 
 
+class TestRightmoveSearchTotal(unittest.TestCase):
+    """A stated zero and an unreadable page must not share a total: the first
+    is a quiet window, the second may be a block. Both returned 0, and a
+    quiet outcode failed the whole search of 2026-09-26."""
+
+    def page(self, count, n=0):
+        props = [{"propertyUrl": "/properties/%d" % i, "displayAddress": "x"}
+                 for i in range(n)]
+        sr = {"properties": props}
+        if count is not None:
+            sr["resultCount"] = count
+        body = {"props": {"pageProps": {"searchResults": sr}}}
+        return '<script id="__NEXT_DATA__" type="application/json">%s</script>' % (
+            json.dumps(body))
+
+    def test_a_stated_zero_is_zero(self):
+        self.assertEqual(portals.rightmove_search(self.page(0), None), ([], 0))
+        self.assertEqual(portals.rightmove_search(self.page("0"), None), ([], 0))
+
+    def test_a_comma_count_is_read(self):
+        self.assertEqual(portals.rightmove_search(self.page("1,234", n=1), None)[1], 1234)
+
+    def test_an_unreadable_page_is_none(self):
+        self.assertEqual(portals.rightmove_search("<html>challenge</html>", None), ([], None))
+        self.assertIsNone(portals.rightmove_search(self.page(None), None)[1])
+
+
+class TestEmptyFirstPage(unittest.TestCase):
+    RM = "https://www.rightmove.co.uk/property-to-rent/find.html?locationIdentifier=OUTCODE%5E855"
+    ZP = "https://www.zoopla.co.uk/to-rent/property/london/?beds_min=2"
+
+    def setUp(self):
+        from flatsearch import fetch
+        self.fetch = fetch
+
+    def status(self, url, total, page_no=0):
+        return self.fetch.empty_status(url, page_no, total, portals.portal_for(url))
+
+    def test_a_stated_zero_in_the_window_is_quiet(self):
+        self.assertEqual(self.status(self.RM + "&maxDaysSinceAdded=3", 0), self.fetch.QUIET)
+
+    def test_an_unreadable_page_is_still_empty(self):
+        self.assertEqual(self.status(self.RM + "&maxDaysSinceAdded=3", None), "EMPTY on page 0")
+
+    def test_a_stated_zero_without_the_window_is_still_empty(self):
+        """Nothing to blame the zero on - the search itself found nothing."""
+        self.assertEqual(self.status(self.RM, 0), "EMPTY on page 0")
+
+    def test_a_portal_that_cannot_state_zero_is_still_empty(self):
+        self.assertEqual(self.status(self.ZP + "&added=3_days", 0), "EMPTY on page 0")
+
+    def test_past_page_zero_is_the_end(self):
+        self.assertEqual(self.status(self.RM, None, page_no=2), "ok")
+
+    def test_quiet_needs_a_sibling_that_found_something(self):
+        """The window fails closed on a value the portal rejects, as a stated
+        zero - so a quiet search is only vouched for by one that was not."""
+        self.assertEqual(self.fetch.quiet_problems("rm", 1, 222), [])
+        self.assertEqual(len(self.fetch.quiet_problems("rm", 6, 0)), 1)
+        self.assertEqual(self.fetch.quiet_problems("rm", 0, 0), [])
+
+
+class TestHasProse(unittest.TestCase):
+    """A Zoopla stub extracted to nothing but an availability date, passed
+    the empty-page guard, and was committed as read on 2026-09-25."""
+
+    def test_derived_facts_alone_are_not_a_page(self):
+        from flatsearch import fetch
+        self.assertFalse(fetch.has_prose(["Availability: 2026-09-25"]))
+        self.assertFalse(fetch.has_prose(["Size: 900 sq ft", "Floorplan floors: First"]))
+        self.assertFalse(fetch.has_prose([]))
+
+    def test_a_description_or_features_is(self):
+        from flatsearch import fetch
+        self.assertTrue(fetch.has_prose(["Availability: now", "Description: A flat."]))
+        self.assertTrue(fetch.has_prose(["Key features: Lift / Balcony"]))
+
+
 class TestValidateVerdict(unittest.TestCase):
     URL = "https://www.example.com/properties/1"
     PAGE = "A superb flat with full comfort cooling to all rooms."

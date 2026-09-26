@@ -890,8 +890,8 @@ def write_baseline(cfg) -> dict:
 def ensure_baseline(cfg) -> dict:
     """Fill in a missing baseline without moving one already taken today.
 
-    `search` is also how a partly failed morning is repaired - one portal
-    re-run with `--host` - and a repair must not reset where the morning
+    `search` is also how a partly failed morning is repaired - the search
+    re-run after a failure - and a repair must not reset where the morning
     started, or the delta covers the repair instead of the run.
     """
     base = read_baseline(cfg)

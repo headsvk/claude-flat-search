@@ -102,7 +102,7 @@ class TestRunStopsForJudgement(unittest.TestCase):
         morning of 2026-09-21 was driven stage by stage, took no baseline,
         printed no delta, and the digest worked the numbers out by hand and
         got two of them wrong. `search` fills that gap - and only fills it,
-        so a `--host` repair cannot reset the morning it is repairing."""
+        so a repair re-run cannot reset the morning it is repairing."""
         taken = []
         real = cli.core.ensure_baseline
         cli.core.ensure_baseline = lambda cfg: taken.append(len(self.calls))
