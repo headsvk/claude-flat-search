@@ -123,7 +123,7 @@ def cmd_run(args) -> int:
         print("  %s" % (cfg.runs_dir / "needs_review.json"))
         print()
         print("Judge them (in_unit vs communal_only, with a VERBATIM quote), write")
-        print("  %s" % (cfg.runs_dir / "verdicts_haiku.json"))
+        print("  %s" % (cfg.runs_dir / judge_mod.NEW_VERDICTS))
         print("then finish with:  flat-search finish")
         print("=" * 72)
         return 0

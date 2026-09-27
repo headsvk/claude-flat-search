@@ -162,17 +162,77 @@ class TestCarryForward(JudgeCase):
 
 class TestStamping(JudgeCase):
 
+    def model(self, *urls):
+        """What the model writes: the morning's new verdicts, in their own file."""
+        core.write_json(self.cfg.runs_dir / judge.NEW_VERDICTS,
+                        {"verdicts": [{"url": u,
+                                       "aircon": {"verdict": "yes", "scope": "in_unit",
+                                                  "evidence": "air conditioning throughout"}}
+                                      for u in urls]})
+
+    def finish(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            judge.merge_verdicts(self.cfg)
+        return {v["url"]: v for v in
+                core.read_json(self.cfg.runs_dir / judge.JUDGED_STORE)["verdicts"]}
+
     def test_merge_records_which_page_each_verdict_was_read_off(self):
         url = "https://example.com/1"
         self.cache(url, AC_TEXT)
         core.write_json(self.cfg.runs_dir / "verdicts.json", {"verdicts": []})
-        self.haiku({"url": url,
+        self.model(url)
+        stored = self.finish()
+        self.assertEqual(stored[url]["text_sha"], judge.text_sha(AC_TEXT))
+
+    def test_a_second_morning_keeps_the_first_mornings_verdicts(self):
+        """The store is added to, never replaced. When the model wrote into it
+        directly, each morning left only its own handful, and the next run
+        sent every earlier listing back to the model - 81 of them on
+        2026-09-27, all but 4 already judged."""
+        first, second = "https://example.com/1", "https://example.com/2"
+        self.cache(first, AC_TEXT)
+        self.model(first)
+        self.judge()
+        self.finish()
+
+        self.cache(second, AC_TEXT)
+        pending, _, review = self.judge()
+        self.assertEqual([r["url"] for r in review], [second])
+        self.model(second)
+        stored = self.finish()
+        self.assertEqual(set(stored), {first, second})
+
+        pending, verdicts, _ = self.judge()
+        self.assertEqual(pending, 0)
+        self.assertEqual({v["url"]: v["aircon"]["verdict"] for v in verdicts},
+                         {first: "yes", second: "yes"})
+
+    def test_the_new_file_is_consumed(self):
+        """A second `finish` must not stamp yesterday's verdicts against a page
+        that has changed since the model read it."""
+        url = "https://example.com/1"
+        self.cache(url, AC_TEXT)
+        self.model(url)
+        self.finish()
+        self.assertFalse((self.cfg.runs_dir / judge.NEW_VERDICTS).exists())
+        self.cache(url, "some entirely different description with air conditioning")
+        stored = self.finish()
+        self.assertEqual(stored[url]["text_sha"], judge.text_sha(AC_TEXT))
+
+    def test_an_old_verdict_is_not_restamped_against_todays_page(self):
+        """Stamping the whole store would bless a rewritten page's stale verdict."""
+        old, new = "https://example.com/1", "https://example.com/2"
+        self.cache(old, "a rewritten description, air conditioning in the gym")
+        self.cache(new, AC_TEXT)
+        self.haiku({"url": old, "text_sha": judge.text_sha(AC_TEXT),
                     "aircon": {"verdict": "yes", "scope": "in_unit",
                                "evidence": "air conditioning throughout"}})
-        with contextlib.redirect_stdout(io.StringIO()):
-            judge.merge_verdicts(self.cfg)
-        stored = core.read_json(self.cfg.runs_dir / "verdicts_haiku.json")
-        self.assertEqual(stored["verdicts"][0]["text_sha"], judge.text_sha(AC_TEXT))
+        self.model(new)
+        stored = self.finish()
+        self.assertEqual(stored[old]["text_sha"], judge.text_sha(AC_TEXT))
+        _, _, review = self.judge()
+        self.assertEqual([r["url"] for r in review], [old])
+        self.assertTrue(review[0]["rejudge"])
 
     def test_the_fingerprint_ignores_whitespace_churn(self):
         """A portal reflowing its markup is not a rewritten description, and

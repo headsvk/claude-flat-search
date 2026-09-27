@@ -584,7 +584,7 @@ def carry_verdict(ac: dict, existing: dict | None) -> dict:
 UNJUDGED = """NOT COMMITTING - %d listing(s) a model was asked to read are still unread.
 %s
 They are in %s. Judge them with a Haiku subagent (in_unit vs communal_only,
-with a VERBATIM quote) into verdicts_haiku.json, then `flat-search finish`,
+with a VERBATIM quote) into verdicts_haiku_new.json, then `flat-search finish`,
 which merges both files and commits.
 
 A listing committed now is written `unchecked` into today's daily file, and

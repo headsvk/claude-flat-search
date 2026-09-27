@@ -203,6 +203,16 @@ def text_sha(text: str) -> str:
     return hashlib.sha256(core.norm(text).encode("utf-8")).hexdigest()[:16]
 
 
+# Two files, on purpose. The store is every model verdict ever made, and is
+# what `load_judged` carries forward. The model writes only the morning's new
+# ones, to NEW_VERDICTS, and `finish` folds them into the store. When the
+# model wrote straight into the store, each morning replaced it with that
+# day's handful: 2026-09-26 left 6 verdicts in it, and 2026-09-27 re-flagged
+# 81 listings, all but 4 already judged.
+JUDGED_STORE = "verdicts_haiku.json"
+NEW_VERDICTS = "verdicts_haiku_new.json"
+
+
 def load_judged(cfg) -> tuple[dict, list]:
     """Model verdicts from earlier runs that the current page still supports.
 
@@ -220,7 +230,7 @@ def load_judged(cfg) -> tuple[dict, list]:
 
     -> ({url: verdict}, [urls whose page changed under a stored verdict])
     """
-    path = cfg.runs_dir / "verdicts_haiku.json"
+    path = cfg.runs_dir / JUDGED_STORE
     if not path.exists():
         return {}, []
     try:
@@ -351,46 +361,61 @@ def merge_verdicts(cfg) -> int:
     sequence would mark everything missing from the second as unchecked. They
     have to be merged first. This was a manual python -c one-liner in the
     runbook, which is precisely the kind of step that eventually gets it wrong.
+
+    The morning's new verdicts are also folded into the store, by URL, so the
+    next run carries them forward. The store is only ever added to here; the
+    new file is then moved aside, so a later `finish` cannot stamp it again
+    against a page that has changed since the model read it.
     """
     import io
     import json
 
     base = cfg.runs_dir / "verdicts.json"
-    extra = cfg.runs_dir / "verdicts_haiku.json"
-    merged = {}
-    for path in (base, extra):
+    store = cfg.runs_dir / JUDGED_STORE
+    new = cfg.runs_dir / NEW_VERDICTS
+
+    def load(path):
         if not path.exists():
-            continue
+            return []
         # Always explicit UTF-8: the Windows default codepage raises on
         # listing text.
-        data = json.load(io.open(path, encoding="utf-8"))
-        for v in data.get("verdicts", []):
+        return json.load(io.open(path, encoding="utf-8")).get("verdicts", [])
+
+    fresh = load(new)
+    stamp_judged(cfg, fresh)
+
+    merged = {}
+    for v in load(base) + fresh:
+        url = str(v.get("url", "")).strip()
+        if url:
+            merged[url] = v
+    core.write_json(base, {"verdicts": list(merged.values())})
+
+    if fresh:
+        kept = {}
+        for v in load(store) + fresh:
             url = str(v.get("url", "")).strip()
             if url:
-                merged[url] = v
-    core.write_json(base, {"verdicts": list(merged.values())})
-    stamp_judged(cfg, extra)
+                kept[url] = v
+        core.write_json(store, {"verdicts": list(kept.values())})
+        new.replace(new.with_suffix(".merged.json"))
     return len(merged)
 
 
-def stamp_judged(cfg, path) -> int:
-    """Record which page each model verdict was read off, in that file.
+def stamp_judged(cfg, verdicts) -> int:
+    """Record which page each model verdict was read off, on the verdict.
 
     Without this the verdict is just a claim with no date on it, and the next
     run cannot tell a settled listing from one whose description has since
     been rewritten. The fingerprint is what lets `load_judged` carry a verdict
     forward instead of paying for it again, and what makes a changed page
     re-flag rather than quietly collapse to `unstated` at commit.
+
+    Only the morning's new verdicts are stamped. Re-stamping the store would
+    bless every old verdict against today's page, rewritten or not.
     """
-    path = pathlib.Path(path)
-    if not path.exists():
-        return 0
-    try:
-        data = core.read_json(path)
-    except (ValueError, OSError):
-        return 0
     stamped = 0
-    for v in data.get("verdicts", []):
+    for v in verdicts:
         url = str(v.get("url", "")).strip()
         if not url:
             continue
@@ -403,5 +428,4 @@ def stamp_judged(cfg, path) -> int:
             continue
         v["text_sha"] = text_sha(text)
         stamped += 1
-    core.write_json(path, data)
     return stamped

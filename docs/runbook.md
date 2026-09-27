@@ -211,7 +211,12 @@ whole page. Pass the subagent the file PATH, not the contents. Ask for, per entr
                             "scope": "in_unit"|"communal_only",
                             "evidence": "<verbatim quote from that entry's text>"}}
 
-written to `data/runs/verdicts_haiku.json` as `{"verdicts": [...]}`.
+written to `data/runs/verdicts_haiku_new.json` as `{"verdicts": [...]}`.
+
+**Never write the model's output to `verdicts_haiku.json`.** That file is the store of
+every verdict ever made, and it is what the next run carries forward. Writing the
+morning's handful into it replaces the store: 2026-09-26 left 6 verdicts in it, and
+2026-09-27 re-flagged 81 listings, all but 4 already judged.
 
 The distinction that matters is **in_unit versus communal_only** — air conditioning
 in the residents' gym is not air conditioning in the flat. The evidence must be
@@ -224,10 +229,11 @@ the two in sequence would mark everything missing from the second as unchecked.
 
     flat-search finish
 
-`finish` also stamps each model verdict with the fingerprint of the page it was read
-off. That is what lets the next run carry it forward instead of paying for it again,
-so judge by writing `verdicts_haiku.json` and running `finish` — not by editing
-`verdicts.json` directly.
+`finish` stamps each new verdict with the fingerprint of the page it was read off,
+adds it to the store by URL, and moves `verdicts_haiku_new.json` aside as
+`verdicts_haiku_new.merged.json`. That is what lets the next run carry it forward
+instead of paying for it again, so judge by writing `verdicts_haiku_new.json` and
+running `finish` — not by editing `verdicts.json` or the store directly.
 
 Open these files with an explicit `encoding='utf-8'`; on Windows the default
 codepage raises UnicodeDecodeError on listing text.
