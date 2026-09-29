@@ -19,7 +19,7 @@ import json
 import pathlib
 import re
 
-from . import core
+from . import areas, core
 
 RANK = {"High": 0, "Medium": 1, "Low": 2}
 DECISION_RE = re.compile(r"^\s*-\s*\[(?P<status>[^\]]*)\]\s*(?P<url>https?://\S+)\s*(?:—|-|:)?\s*(?P<note>.*)$")
@@ -57,6 +57,14 @@ def cell(value, dash: str = "–") -> str:
     if value in (None, "", "Unknown"):
         return dash
     return str(value).replace("|", "/")
+
+
+def area_cell(listing: dict) -> str:
+    """The address, plus the neighbourhood its postcode district is known as
+    when the address does not already say it."""
+    address = cell(listing.get("postcode") or listing.get("area"))
+    name = areas.label(address, core.district(listing))
+    return "%s · _%s_" % (address, name) if name else address
 
 
 def size_cell(listing: dict) -> str:
@@ -109,12 +117,42 @@ def flags(listing: dict) -> str:
 #              block is a fact about the block, not five finds.
 
 _ADDR_DROP = {"london", "the", "uk", "greater"}
+_OUTCODE = re.compile(r"^[a-z]{1,2}\d{1,2}[a-z]?$")
+_INCODE = re.compile(r"^\d[a-z]{2}$")
+_POSTCODE = re.compile(r"\b([A-Z]{1,2}\d{1,2}[A-Z]?)(?:\s+(\d[A-Z]{2}))?\b")
+
+
+def _addr_text(listing: dict) -> str:
+    return str(listing.get("postcode") or listing.get("area") or "")
 
 
 def addr_key(listing: dict) -> str:
-    raw = listing.get("postcode") or listing.get("area") or ""
-    words = re.sub(r"[^a-z0-9 ]", " ", str(raw).lower()).split()
-    return " ".join(w for w in words if w not in _ADDR_DROP)[:40]
+    """The address with the postcode taken out. Rightmove often prints none
+    where Zoopla prints the district: "The Highway, Wapping" and "The Highway,
+    Wapping E1W" are one ad on two portals, and kept the key apart on
+    2026-09-28 - 64 cross-portal pairs on the live set. The postcode is
+    compared separately in `mergeable`, where only two STATED ones disagreeing
+    can split a pair. An incode is only dropped straight after an outcode, or
+    "1st" in "1st floor" would go with it."""
+    words = re.sub(r"[^a-z0-9 ]", " ", _addr_text(listing).lower()).split()
+    kept, after_outcode = [], False
+    for w in words:
+        if _OUTCODE.match(w):
+            after_outcode = True
+            continue
+        if after_outcode and _INCODE.match(w):
+            after_outcode = False
+            continue
+        after_outcode = False
+        if w not in _ADDR_DROP:
+            kept.append(w)
+    return " ".join(kept)[:40]
+
+
+def postcode_parts(listing: dict) -> tuple:
+    """(outcode, incode), either None when the address does not state it."""
+    m = _POSTCODE.search(_addr_text(listing).upper())
+    return (m.group(1), m.group(2)) if m else (None, None)
 
 
 def dupe_key(listing: dict):
@@ -137,6 +175,9 @@ AGREE_ON = ("floor", "size_sqft", "size_sqft_plan")
 def mergeable(a: dict, b: dict) -> bool:
     if dupe_key(a) is None or dupe_key(a) != dupe_key(b):
         return False
+    for x, y in zip(postcode_parts(a), postcode_parts(b)):
+        if x and y and x != y:
+            return False
     for field in AGREE_ON:
         x, y = a.get(field), b.get(field)
         if x and y and str(x) != str(y):
@@ -169,8 +210,22 @@ def building_counts(listings: list) -> dict:
             continue
         key = addr_key(l)
         if key:
+            key = (key, postcode_parts(l)[0])
             out[key] = out.get(key, 0) + 1
     return out
+
+
+def units_in_building(buildings: dict, listing: dict) -> int:
+    """Keyed by address AND stated outcode: `addr_key` drops the postcode, so
+    "Kings Road SW3" and "Kings Road SW6" share a key and are two streets -
+    four such keys on the live set, 2026-09-29. An ad stating no outcode joins
+    whichever block it could be in, the larger one when there are several."""
+    key, outcode = addr_key(listing), postcode_parts(listing)[0]
+    unstated = buildings.get((key, None), 0)
+    if outcode:
+        return buildings.get((key, outcode), 0) + unstated
+    stated = [n for (k, o), n in buildings.items() if k == key and o]
+    return unstated + max(stated, default=0)
 
 
 def links(group: list) -> str:
@@ -178,10 +233,55 @@ def links(group: list) -> str:
                      for l in group)
 
 
-def table(rows: list, buildings: dict | None = None) -> list:
-    out = ["| £pcm | area | sqft | fl | beds/bath | notable | listing |",
-           "|---|---|---|---|---|---|---|"]
-    for group in group_dupes(rows):
+def by_tier(live: list) -> dict:
+    """Duplicate groups, each filed under the tier of its best-ranked ad.
+
+    Grouped across the whole set BEFORE sectioning. Two ads for one flat can
+    rank differently - one says "furnished or unfurnished", the other just
+    "Furnished" - and grouping within each section showed The Highway, Wapping
+    as a High row and a Medium row on 2026-09-28. `live` must already be in
+    `order`, so a group's first ad is its best."""
+    out: dict = {}
+    for group in group_dupes(live):
+        out.setdefault(str(group[0].get("priority")), []).append(group)
+    return out
+
+
+def section_head(tier: str, groups: list) -> str:
+    ads = sum(len(g) for g in groups)
+    head = "## %s — %d" % (tier, len(groups))
+    return head + (" (%d ads)" % ads if ads != len(groups) else "")
+
+
+def furnishing_label(listing: dict) -> str | None:
+    raw = str(listing.get("furnished") or "").strip().lower()
+    if "or unfurnished" in raw or "unfurnished or" in raw:
+        return "either"
+    if raw.startswith("part"):
+        return "part"
+    if raw in ("unfurnished", "no"):
+        return "unfurnished"
+    if raw in ("furnished", "yes"):
+        return "furnished"
+    return None                         # "Ask agent", "Unknown", blank
+
+
+def furnishing_cell(group: list) -> str:
+    """Every value the ads state. Ads for one flat can disagree - The Highway,
+    Wapping said "either" on Rightmove and "furnished" on Zoopla - and either
+    one alone would misstate the other."""
+    seen = []
+    for l in group:
+        label = furnishing_label(l)
+        if label and label not in seen:
+            seen.append(label)
+    return " / ".join(seen) or "?"
+
+
+def table(groups: list, buildings: dict | None = None) -> list:
+    out = ["| £pcm | area | sqft | fl | beds/bath | furnishing | notable | listing |",
+           "|---|---|---|---|---|---|---|---|"]
+    for group in groups:
         l = group[0]
         note = flags(l)
         extra = []
@@ -190,17 +290,18 @@ def table(rows: list, buildings: dict | None = None) -> list:
             # is as far as this can honestly go. The links are all here so
             # the call can be made by looking.
             extra.append("%d near-identical ads" % len(group))
-        n = (buildings or {}).get(addr_key(l), 0)
+        n = units_in_building(buildings or {}, l)
         if n > len(group):
             extra.append("%d units in this building" % n)
         if extra:
             note = "%s · %s" % (note, "; ".join(extra)) if note != "–" else "; ".join(extra)
-        out.append("| %s | %s | %s | %s | %s/%s | %s | %s |" % (
+        out.append("| %s | %s | %s | %s | %s/%s | %s | %s | %s |" % (
             money(l.get("price_pcm")),
-            cell(l.get("postcode") or l.get("area")),
+            area_cell(l),
             size_cell(l),
             cell(l.get("floor"), "–"),
             cell(l.get("bedrooms"), "?"), cell(l.get("bathrooms"), "?"),
+            furnishing_cell(group),
             note,
             links(group)))
     return out
@@ -296,14 +397,11 @@ def render_daily(state: dict, decisions: dict, day: str) -> tuple:
         out += ["_%d more are waiting on a detail page. They will appear in a later "
                 "file, complete, rather than as a stub here._" % waiting, ""]
 
+    tiers = by_tier(live)
     for tier in ("High", "Medium", "Low"):
-        rows = [l for l in live if str(l.get("priority")) == tier]
-        if rows:
-            groups = len(group_dupes(rows))
-            head = "## %s — %d" % (tier, groups)
-            if groups != len(rows):
-                head += " (%d ads)" % len(rows)
-            out += [head, ""] + table(rows, buildings) + [""]
+        groups = tiers.get(tier)
+        if groups:
+            out += [section_head(tier, groups), ""] + table(groups, buildings) + [""]
 
     if dead:
         out += ["## Ruled out on sight — %d" % len(dead), "",
@@ -316,7 +414,7 @@ def render_daily(state: dict, decisions: dict, day: str) -> tuple:
                     why = part.split("rejected on detail:")[1].strip()
             out.append("| %s | %s | %s | [%s](%s) |" % (
                 why or str(l.get("status")).lower(), money(l.get("price_pcm")),
-                cell(l.get("postcode") or l.get("area")),
+                area_cell(l),
                 str(l.get("platform") or "link"), l.get("url")))
         out.append("")
     return '\n'.join(out), fresh, held, len(live) + len(dead)
@@ -360,19 +458,16 @@ def render(state: dict, decisions: dict, limit_low: int = 60) -> str:
            "To record a call, add a line to `decisions.md` — this file is regenerated every run.",
            ""]
 
+    tiers = by_tier(live)
     for tier in ("High", "Medium", "Low"):
-        rows = [l for l in live if str(l.get("priority")) == tier]
-        if not rows:
+        groups = tiers.get(tier)
+        if not groups:
             continue
-        shown = rows if tier != "Low" else rows[:limit_low]
-        groups = len(group_dupes(rows))
-        head = "## %s — %d" % (tier, groups)
-        if groups != len(rows):
-            head += " (%d ads)" % len(rows)
-        out += [head, ""] + table(shown, buildings)
-        if len(shown) < len(rows):
+        shown = groups if tier != "Low" else groups[:limit_low]
+        out += [section_head(tier, groups), ""] + table(shown, buildings)
+        if len(shown) < len(groups):
             out.append("")
-            out.append("_%d more %s listings in `state.json`._" % (len(rows) - len(shown), tier))
+            out.append("_%d more %s listings in `state.json`._" % (len(groups) - len(shown), tier))
         out.append("")
 
     if dead:
@@ -386,7 +481,7 @@ def render(state: dict, decisions: dict, limit_low: int = 60) -> str:
             out.append("| %s | %s | %s | [%s](%s) |" % (
                 why or l.get("decision_note") or str(l.get("status")).lower(),
                 money(l.get("price_pcm")),
-                cell(l.get("postcode") or l.get("area")),
+                area_cell(l),
                 str(l.get("platform") or "link"), l.get("url")))
         out.append("")
     return "\n".join(out)

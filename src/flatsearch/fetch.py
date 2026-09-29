@@ -510,6 +510,19 @@ async def floorplan_size(session, html, portal_name, cfg, url):
     return result if (result.get("sqft") or result.get("floors")) else None
 
 
+def merge_detail(row: dict, info: dict) -> None:
+    """Fill what the search row left blank. The one field the page may also
+    CORRECT is the postcode: a search row often carries the address without
+    one ("4-7 Lombard Lane, London"), which is not blank, and would otherwise
+    keep the district unknown for good."""
+    for k, v in info.items():
+        if not row.get(k):
+            row[k] = v
+        elif k == "postcode" and v and core.district({"postcode": row[k]}) is None \
+                and core.district({"postcode": v}) is not None:
+            row[k] = v
+
+
 async def enrich_detail(session, pt, url, html, text, parts, info, row, cfg):
     """Everything read AFTER the portal's own detail extractor: Rightmove's
     labelled fields, and the floorplan.
@@ -650,9 +663,7 @@ async def run_details(cfg, queue_path, stage1_path, host=None):
                                      "source": pt["name"].lower() + "-detail", "text": text})
                     row = by_url.get(it["url"])
                     if row:
-                        for k, v in info.items():
-                            if not row.get(k):
-                                row[k] = v
+                        merge_detail(row, info)
                     done += 1
                     host_done += 1
                     print("  ok %-46s %5d chars" % (it["url"][-46:], len(text)))
@@ -687,9 +698,7 @@ async def run_details(cfg, queue_path, stage1_path, host=None):
                                          "text": text})
                         row = by_url.get(it["url"])
                         if row:
-                            for k, v in info.items():
-                                if not row.get(k):
-                                    row[k] = v
+                            merge_detail(row, info)
                         recovered = True
             except Exception as e:
                 print("  FAIL(retry) %-36s %s" % (it["url"][-36:], str(e)[:50]))

@@ -30,6 +30,7 @@ DEFAULT_CONFIG_NAME = "criteria.toml"
 
 FURNISHINGS = ("furnished", "unfurnished", "either")
 AIRCON_MODES = ("preferred", "required", "ignored")
+CONCIERGE_MODES = ("preferred", "expected", "ignored")
 
 # section -> {key: (type, default)}. A default of None means the key is required.
 SCHEMA: dict[str, dict[str, tuple]] = {
@@ -41,10 +42,12 @@ SCHEMA: dict[str, dict[str, tuple]] = {
     },
     "preferences": {
         "furnishing": (str, "either"),
+        "furnishing_strict": (bool, False),
         "min_sqft": (int, 0),
         "good_floor_from": (int, 2),
         "lift_required_from_floor": (int, 3),
         "aircon": (str, "preferred"),
+        "concierge": (str, "preferred"),
     },
     "districts": {
         "only": (bool, False),
@@ -87,10 +90,12 @@ class Config:
     budget_pcm: int
 
     furnishing: str
+    furnishing_strict: bool
     min_sqft: int
     good_floor_from: int
     lift_required_from_floor: int
     aircon: str
+    concierge: str
 
     districts_only: bool
     prime_districts: tuple
@@ -240,6 +245,10 @@ def load(path: str | pathlib.Path | None = None) -> Config:
     if aircon not in AIRCON_MODES:
         raise ConfigError("[preferences] aircon must be one of %s"
                           % ", ".join(AIRCON_MODES))
+    concierge = str(values["preferences.concierge"]).strip().lower()
+    if concierge not in CONCIERGE_MODES:
+        raise ConfigError("[preferences] concierge must be one of %s"
+                          % ", ".join(CONCIERGE_MODES))
 
     # Every numeric key, not a subset of them. The list used to skip
     # max_bedrooms, the two floor thresholds and move_in_slack_days, so a typo'd
@@ -290,10 +299,12 @@ def load(path: str | pathlib.Path | None = None) -> Config:
         min_bathrooms=values["requirements.min_bathrooms"],
         budget_pcm=values["requirements.budget_pcm"],
         furnishing=furnishing,
+        furnishing_strict=values["preferences.furnishing_strict"],
         min_sqft=values["preferences.min_sqft"],
         good_floor_from=values["preferences.good_floor_from"],
         lift_required_from_floor=values["preferences.lift_required_from_floor"],
         aircon=aircon,
+        concierge=concierge,
         districts_only=values["districts.only"],
         prime_districts=_districts(values["districts.prime"], "districts", "prime"),
         affluent_districts=_districts(values["districts.affluent"], "districts", "affluent"),

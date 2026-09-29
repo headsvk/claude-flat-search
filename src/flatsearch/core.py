@@ -206,6 +206,25 @@ def hard_filter(listing: dict, cfg: dict) -> str | None:
     return None
 
 
+def is_flexible_furnishing(listing: dict) -> bool:
+    raw = str(listing.get("furnished", "")).strip().lower()
+    return "or unfurnished" in raw or "unfurnished or" in raw
+
+
+def furnishing_of(listing: dict, pref: str) -> str | None:
+    """What the listing states, normalised. None when it states nothing usable."""
+    raw = str(listing.get("furnished", "")).strip().lower()
+    if is_flexible_furnishing(listing):
+        return pref                     # landlord flexible - satisfies either preference
+    if raw.startswith("part"):
+        return "part furnished"
+    if raw in ("no", "unfurnished"):
+        return "unfurnished"
+    if raw in ("yes", "furnished"):
+        return "furnished"
+    return None
+
+
 def base_tier(listing: dict, cfg: dict) -> tuple[int, list[str]]:
     notes: list[str] = []
 
@@ -257,18 +276,9 @@ def base_tier(listing: dict, cfg: dict) -> tuple[int, list[str]]:
             notes.append("bathroom count unconfirmed")
 
     pref = cfg.furnishing
-    raw = str(listing.get("furnished", "")).strip().lower()
-    if "or unfurnished" in raw or "unfurnished or" in raw:
-        got = pref                      # landlord flexible - satisfies either preference
+    got = furnishing_of(listing, pref)
+    if got == pref and is_flexible_furnishing(listing):
         notes.append("landlord flexible on furnishing")
-    elif raw.startswith("part"):
-        got = "part furnished"
-    elif raw in ("no", "unfurnished"):
-        got = "unfurnished"
-    elif raw in ("yes", "furnished"):
-        got = "furnished"
-    else:
-        got = None
     if pref in ("unfurnished", "furnished"):
         if got is None:
             notes.append("furnishing unconfirmed")
@@ -310,7 +320,7 @@ def apply_amenities(tier: int, listing: dict, cfg: dict) -> tuple[int, list[str]
     elif lift == "yes":
         notes.append("lift")
 
-    if str(listing.get("concierge", "") or "").lower() == "yes":
+    if cfg.concierge != "ignored" and has_concierge(listing):
         tier = max(0, tier - 1)
         notes.append("concierge/porter")
 
@@ -327,6 +337,47 @@ def apply_amenities(tier: int, listing: dict, cfg: dict) -> tuple[int, list[str]
         notes.append("size not stated - verify")
     elif isinstance(size, (int, float)):
         notes.append(f"{int(size)} sq ft")
+    return tier, notes
+
+
+def has_concierge(listing: dict) -> bool:
+    return str(listing.get("concierge", "") or "").lower() == "yes"
+
+
+def apply_ceilings(tier: int, listing: dict, cfg: dict) -> tuple[int, list[str]]:
+    """Rules that keep a listing out of High, however many bonuses it stacks.
+
+    Applied last, after every step up. A one-step demotion is cancelled by any
+    one bonus: with furnishing costing a tier, 193 of 462 High listings on
+    2026-09-28 were fully furnished. Neither rule ever lowers below Medium, and
+    neither excludes.
+
+    A partly furnished flat is not capped - it keeps its one-step demotion. An
+    unstated furnishing is not capped either: unknown is flagged, not absence.
+    An unmentioned concierge IS capped, because nobody advertises the absence
+    of one - the lift rule makes the same call.
+    """
+    notes: list[str] = []
+    if tier > 0:
+        return tier, notes
+    pref = cfg.furnishing
+    if cfg.furnishing_strict and pref in ("unfurnished", "furnished"):
+        got = furnishing_of(listing, pref)
+        if got in ("unfurnished", "furnished") and got != pref:
+            tier = 1
+            notes.append(f"{got} - never High")
+    if cfg.concierge == "expected" and not has_concierge(listing):
+        tier = 1
+        notes.append("no concierge mentioned - never High")
+    # A plan-read size never rejects - OCR turns 814 into 314 - but a High
+    # row reading ~600* is not one worth opening first. Only when no size is
+    # stated: a stated size below the minimum was already rejected.
+    plan = listing.get("size_sqft_plan")
+    if cfg.min_sqft and isinstance(plan, (int, float)) and plan < cfg.min_sqft \
+            and not listing.get("size_sqft"):
+        tier = 1
+        notes.append("floorplan reads %d sq ft (min %d) - never High"
+                     % (plan, cfg.min_sqft))
     return tier, notes
 
 
@@ -729,6 +780,8 @@ def commit(cfg, stage1_path, verdicts_path=None, update=False):
         notes += am_notes
         tier, ac_notes = apply_aircon(tier, ac, cfg)
         notes += ac_notes
+        tier, cap_notes = apply_ceilings(tier, listing, cfg)
+        notes += cap_notes
         if listing.get("notes"):
             notes.insert(0, str(listing["notes"]))
         if unread_note:

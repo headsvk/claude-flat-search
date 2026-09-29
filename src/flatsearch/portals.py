@@ -248,8 +248,21 @@ def rightmove_search(html: str, page):
     return out, int(count) if count.isdigit() else None
 
 
+# The page title states the outcode even when the address line does not:
+# "2 bedroom apartment for rent in 4-7 Lombard Lane, London, EC4Y" against a
+# search card reading "4-7 Lombard Lane, London". Measured 2026-09-28: 557 of
+# 2016 live listings had no district at all, most of them Rightmove - and an
+# unknown district is never rejected, so an EC4Y flat was ranked High on an
+# area list that did not contain it.
+RM_TITLE_ADDR = re.compile(
+    r"<title[^>]*>[^<]*?\bfor (?:rent|sale) in ([^<]*?\b[A-Z]{1,2}\d{1,2}[A-Z]?(?:\s+\d[A-Z]{2})?)\s*</title>")
+
+
 def rightmove_detail(html: str, text: str = ""):
     parts, info = [], {}
+    addr = RM_TITLE_ADDR.search(html or "")
+    if addr:
+        info["postcode"] = untag(addr.group(1)).strip()
     kf = re.search(r'data-testid="keyFeatures".*?</ul>', html, re.S)
     if kf:
         parts.append("Key features: " + " / ".join(

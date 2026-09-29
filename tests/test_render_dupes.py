@@ -149,5 +149,83 @@ class TestBuildingClusters(unittest.TestCase):
         self.assertNotIn("units in this building", text)
 
 
+class TestDuplicatesAcrossTiers(unittest.TestCase):
+    """2026-09-28: one ad said "furnished or unfurnished", its twin "Furnished".
+    They ranked High and Medium and, grouped per section, showed as two rows."""
+
+    def test_one_flat_ranked_two_ways_is_one_row_at_its_best_tier(self):
+        text, _ = daily([listing("https://rightmove/1", priority="High"),
+                         listing("https://zoopla/1", platform="Zoopla", priority="Medium")])
+        self.assertEqual(len(body_rows(text)), 1)
+        self.assertIn("## High — 1 (2 ads)", text)
+        self.assertNotIn("## Medium", text)
+        self.assertIn("https://zoopla/1", text)
+
+
+class TestFurnishingColumn(unittest.TestCase):
+
+    def test_each_stated_value_has_its_label(self):
+        for raw, want in (("Unfurnished", "unfurnished"), ("FURNISHED", "furnished"),
+                          ("Part furnished", "part"),
+                          ("Furnished or unfurnished, land", "either"),
+                          ("Ask agent", "?"), (None, "?")):
+            with self.subTest(raw=raw):
+                self.assertEqual(render.furnishing_cell([listing("u", furnished=raw)]), want)
+
+    def test_ads_that_disagree_show_both(self):
+        group = [listing("r", furnished="Furnished or unfurnished, land"),
+                 listing("z", furnished="Furnished"), listing("o", furnished=None)]
+        self.assertEqual(render.furnishing_cell(group), "either / furnished")
+
+    def test_the_column_is_in_the_daily_table(self):
+        text, _ = daily([listing("https://rightmove/1", furnished="Part furnished")])
+        self.assertIn("| furnishing |", text)
+        self.assertIn("| part |", text)
+
+
+class TestPostcodeOnOnlyOneAd(unittest.TestCase):
+    """Rightmove often prints no postcode where Zoopla prints the district.
+    2026-09-28: "The Highway, Wapping" and "The Highway, Wapping E1W" were one
+    flat and two rows."""
+
+    def pair(self, a, b):
+        return (listing("https://rightmove/1", area=a, postcode=a),
+                listing("https://zoopla/1", platform="Zoopla", area=b, postcode=b))
+
+    def test_a_postcode_on_one_side_only_still_merges(self):
+        self.assertTrue(render.mergeable(*self.pair("The Highway, Wapping",
+                                                    "The Highway, Wapping E1W")))
+
+    def test_a_full_postcode_against_a_district_merges(self):
+        self.assertTrue(render.mergeable(*self.pair("Girdlers Road, London, W14 0PU",
+                                                    "Girdlers Road, London W14")))
+
+    def test_two_stated_districts_that_disagree_do_not_merge(self):
+        self.assertFalse(render.mergeable(*self.pair("High Street, W5",
+                                                     "High Street, W13")))
+
+    def test_two_stated_incodes_that_disagree_do_not_merge(self):
+        self.assertFalse(render.mergeable(*self.pair("Nine Elms Lane, SW11 7DG",
+                                                     "Nine Elms Lane, SW11 7DH")))
+
+    def test_an_ordinal_is_not_mistaken_for_an_incode(self):
+        """An incode is only dropped straight after an outcode."""
+        self.assertNotEqual(render.addr_key({"area": "1st Floor, Kings Road"}),
+                            render.addr_key({"area": "Kings Road"}))
+
+    def test_one_building_across_the_two_spellings_is_counted_once(self):
+        rows = self.pair("Circus Apartments, London", "Circus Apartments, London E14")
+        buildings = render.building_counts(list(rows))
+        for l in rows:
+            self.assertEqual(render.units_in_building(buildings, l), 2)
+
+    def test_one_street_name_in_two_districts_is_two_buildings(self):
+        """2026-09-29: kings road SW3/SW6, clifton road W9/KT2 on the live set."""
+        rows = self.pair("Kings Road, London SW3", "Kings Road, London SW6")
+        buildings = render.building_counts(list(rows))
+        for l in rows:
+            self.assertEqual(render.units_in_building(buildings, l), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -28,11 +28,21 @@ budget_pcm    = 3000     # per calendar month
 [preferences]
 # Preferences rank a listing. They never exclude one.
 furnishing = "unfurnished"   # furnished | unfurnished | either
+# A mismatch costs a tier, which any one bonus cancels. Strict keeps a flat
+# furnished the wrong way out of High altogether. Part furnished and unstated
+# are not capped.
+furnishing_strict = false
+
+# preferred: a stated concierge or porter gains a tier.
+# expected:  that, and a listing that never mentions one is never High.
+# ignored:   concierge plays no part.
+concierge = "preferred"
 
 # min_sqft rejects only a STATED size below the threshold. Most listings state
 # none (see docs/portals.md for per-portal coverage), so requiring one would
 # delete most of the market; an unstated size is flagged instead. A size read
-# off a floorplan by OCR never rejects either.
+# off a floorplan by OCR never rejects either; below the threshold it only
+# keeps the listing out of High.
 min_sqft = 800
 
 # At or above good_floor_from, gain a tier. Ground floor drops one; lower

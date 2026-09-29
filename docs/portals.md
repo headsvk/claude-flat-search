@@ -407,6 +407,13 @@ before anything is read.
 **Rightmove quotes prime listings per week.** `£1,000 pw` is £4,333 pcm. Always
 convert.
 
+**Rightmove's address line often has no postcode; its page title does.** The card
+reads "4-7 Lombard Lane, London", the title "…for rent in 4-7 Lombard Lane, London,
+EC4Y". On 2026-09-28, 557 of 2016 live listings had no district, most of them
+Rightmove, and an unknown district is never rejected. `details` reads the title and
+lets a stated postcode replace an address without one; that is the only field a
+detail page may overwrite rather than fill.
+
 ## After changing an extractor
 
 Purge the cache it wrote. The cache is the skip condition, so bad entries are never
