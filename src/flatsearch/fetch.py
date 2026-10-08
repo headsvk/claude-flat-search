@@ -294,9 +294,10 @@ def scoped_searches(cfg) -> list:
 
 
 QUIET = "stated 0 in window"
+MISSED = "extractor read 0 of"
 
 
-def empty_status(url: str, page_no: int, total, pt: dict) -> str:
+def empty_status(url: str, page_no: int, total, pt: dict, text: str = "") -> str:
     """What an empty results page means.
 
     Past page 0 it is the end of the results. ON page 0 it is a failure - a
@@ -311,9 +312,17 @@ def empty_status(url: str, page_no: int, total, pt: dict) -> str:
     Measured 2026-09-26: a Rightmove outcode search, scoped to 3 days, stated
     resultCount=0 on a well-formed page and 15 without the window; as a plain
     EMPTY it failed the whole morning's search.
+
+    A page whose visible text states listings is neither: the portal served
+    them and the extractor missed them, so it names that instead of a block.
+    Still a failure - nothing was read - but one a re-run cannot fix.
     """
     if page_no:
         return "ok"
+    stated = portals.stated_count(url, text)
+    if stated:
+        return ("EMPTY on page 0 - %s %s the page states; a page change, "
+                "not a block" % (MISSED, format(stated, ",")))
     spec = portals.window_for(url, portals.RECENT_WINDOWS)
     windowed = bool(spec and re.search(r"[?&]%s=" % re.escape(spec[0]), url))
     if total == 0 and pt.get("states_zero") and windowed:
@@ -354,10 +363,11 @@ async def collect(url: str, seen: set, known: set | None = None,
         # fresh context, pn=2 and pn=3 overlap page 1 by 0%.
         async with Session() as s:
             html = await s.get(target)
+            text = s.text
             res = pt["search"](html, s.page)
             rows, total = (await res) if asyncio.iscoroutine(res) else res
         if not rows:
-            return found, empty_status(url, page_no, total, pt)
+            return found, empty_status(url, page_no, total, pt, text)
 
         page_urls = {r["url"] for r in rows if r.get("url")}
         # Pagination advance is judged PER SEARCH, not against the global dedup
@@ -462,6 +472,10 @@ async def run_search(cfg, out_path, incremental: bool = False) -> bool:
         print("\nPROBLEMS (an empty search is indistinguishable from a block):")
         for p in problems:
             print("   ! %s" % p)
+        if any(MISSED in p for p in problems):
+            print("\nA page that states listings was served, not blocked: its\n"
+                  "extractor no longer reads it. Re-running will not help -\n"
+                  "compare the page with the extractor in portals.py.")
         return False
     return True
 

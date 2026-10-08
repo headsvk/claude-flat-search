@@ -115,6 +115,13 @@ run returned listings — the window fails closed on a value it does not know, a
 as a stated zero. The other portals cannot tell the two apart, so an empty first
 page from them is still a failure.
 
+One empty first page CAN be told from a block: one whose own text states
+listings. Its problem reads `extractor read 0 of N the page states; a page
+change, not a block`. That is still a failure — do not commit — but re-running
+will not fix it. Report it as an extractor break, naming the portal and N, and
+do not retry. 2026-10-08 was this: OnTheMarket moved its payload, the page said
+3,075 results, and the run was reported as a possible block.
+
 A clean run prints `N unique listings` and a per-platform breakdown with no PROBLEMS
 block. Zero new listings after a clean search is a normal quiet morning — report it
 in one line and stop at step 7.
@@ -132,6 +139,11 @@ Two things NOT READY does *not* mean:
   - **A short advert is not a failed extraction.** Private landlords write two
     lines; one agent wrote "No description...". The gate is a thin *rate* over 10%,
     not zero thin pages. `has desc` is the column that detects a broken extractor.
+  - **One advert without a description is not a broken extractor either.** `has
+    desc` fails a portal past 1% missing, and every page without one is listed
+    by URL and fetch date. 2026-10-08: a Rightmove listing read the day after it
+    went up, before the agent wrote its description, held the gate red alone.
+    A broken extractor drops the description on most pages, not one in 1,500.
   - **Today's listings not being cached yet is normal.** That is what the details
     fetch is for. Only a portal with *nothing ever* cached is NEVER SAMPLED.
 

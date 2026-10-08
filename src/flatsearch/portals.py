@@ -417,10 +417,17 @@ def otm_search(html: str, page):
     m = re.search(r'id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
     if not m:
         return [], 0
+    # The Redux state moved under `pageProps` on 2026-10-08, with nothing inside
+    # it changed. The miss extracted to zero rows on a page stating 3,075, which
+    # is exactly how a block looks - so both runs that morning refused to commit.
+    # Read either spelling; the old one costs nothing if it comes back.
     try:
-        res = json.loads(m.group(1))["props"]["initialReduxState"]["results"]
+        props = json.loads(m.group(1))["props"]
+        state = (props.get("pageProps") or {}).get("initialReduxState") \
+            or props["initialReduxState"]
+        res = state["results"]
         lst = res["list"]
-    except (KeyError, TypeError, json.JSONDecodeError):
+    except (KeyError, TypeError, AttributeError, json.JSONDecodeError):
         return [], 0
     # `totalResults` is the server's count for THIS query; `list` is one page of
     # 30 (`currentQuery.frame-size`). Returning the page length as the total
@@ -794,6 +801,38 @@ PORTALS = [
 # `resultCount` sits beside the results in the same payload, and a challenge
 # page carries no payload at all.
 STATES_ZERO = {"rightmove.co.uk"}
+
+
+# The count each search page PRINTS, read from the visible text and never from
+# the payload the extractor reads - so when the payload moves, this still sees
+# the listings it missed. On 2026-10-08 OnTheMarket's moved; the page said
+# "3,075 results", the extractor read 0, and the run reported it as a possible
+# block. A page that states listings is not a block, whatever was extracted.
+#
+# Measured that day on a page with results and one with none. Two traps:
+#   Zoopla prints "0 results found" in its location box on EVERY page, so its
+#     count is the line that is the count and nothing else;
+#   OnTheMarket runs the heading straight on: "3,075 results2+ bedroom...".
+# Only a positive count is ever used, so a pattern that misses costs nothing
+# but this diagnosis - it can never pass an empty page.
+STATED_COUNT = {
+    "rightmove.co.uk": r"^([\d,]+) results?[ \t]*$",
+    "zoopla.co.uk":    r"^([\d,]+) results?[ \t]*$",
+    "onthemarket.com": r"^([\d,]+) results?",
+    "openrent.co.uk":  r"displaying: ([\d,]+) of [\d,]+ propert",
+}
+
+
+def stated_count(url: str, text: str) -> int | None:
+    """The number of results the page says it holds, or None if it says none
+    in a form measured above."""
+    rx = next((r for host, r in STATED_COUNT.items() if host in url), None)
+    if not rx:
+        return None
+    counts = [int(m.group(1).replace(",", ""))
+              for m in re.finditer(rx, text or "", re.M | re.I)
+              if m.group(1).replace(",", "").isdigit()]
+    return max(counts) if counts else None
 
 
 def portal_for(url: str):

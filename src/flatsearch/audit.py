@@ -14,6 +14,7 @@ import pathlib
 
 from . import core
 from . import judge
+from . import portals
 
 
 def pct(n, d):
@@ -78,14 +79,28 @@ def report(cfg, stage1_path) -> bool:
         for rec in core.read_json(state_file).get("listings", []):
             url_portal.setdefault(str(rec.get("url", "")).strip(),
                                   rec.get("platform", "?"))
+    # A listing rejected on its detail page - a stated size under the floor, a
+    # basement - is cached but never tracked, so neither source above knows it.
+    # Its URL still names its portal. Filing those under "?" hid 418 pages from
+    # their own portal's health on 2026-10-08, and a failure among them then
+    # read as an unknown portal rather than a portal.
+    def portal_of(url):
+        pt = portals.portal_for(url)
+        known = url_portal.get(url)
+        return known if known not in (None, "", "?") else (pt["name"] if pt else "?")
+
+    no_desc = collections.defaultdict(list)
     for url, j in cached.items():
-        p = url_portal.get(url, "?")
+        p = portal_of(url)
         s = seen[p]
         text = j.get("text", "")
         s["n"] += 1
         s["chars"].append(len(text))
         s["thin"] += len(text) < 300
-        s["desc"] += "Description:" in text
+        if "Description:" in text:
+            s["desc"] += 1
+        else:
+            no_desc[p].append((j.get("fetched_at") or "?", url))
         s["amen"] += bool(judge.amenities(text))
     # A short advert is not a failed extraction. Measured 2026-09-19: 14 of 652
     # cached pages sit under 300 chars and every one of them is a real, coherent
@@ -95,6 +110,13 @@ def report(cfg, stage1_path) -> bool:
     # worse than having none. What actually distinguishes a broken extractor is
     # the description going MISSING, which `has desc` below measures directly.
     THIN_RATE_FAIL = 0.10
+    # The same lesson, one level down. A broken extractor drops the description
+    # on nearly every page; demanding it on EVERY page let one listing hold the
+    # gate red. 2026-10-08: 1 of 3,532 cached pages had none - Rightmove
+    # 93994725, read the day after it was listed, and on a live read that
+    # morning the unchanged extractor found its description. The agent had
+    # added it since. Missing pages are listed below, never just counted.
+    NO_DESC_RATE_FAIL = 0.01
     print("%-13s %5s %8s %7s %8s %9s  %s" %
           ("portal", "n", "median", "thin", "has desc", "amenities", "verdict"))
     ready = True
@@ -102,13 +124,24 @@ def report(cfg, stage1_path) -> bool:
         ch = sorted(s["chars"])
         med = ch[len(ch) // 2]
         thin_rate = s["thin"] / s["n"] if s["n"] else 0.0
-        ok = med >= 400 and thin_rate <= THIN_RATE_FAIL and s["desc"] == s["n"]
+        no_desc_rate = (s["n"] - s["desc"]) / s["n"] if s["n"] else 0.0
+        ok = (med >= 400 and thin_rate <= THIN_RATE_FAIL
+              and no_desc_rate <= NO_DESC_RATE_FAIL)
         ready &= ok
         print("%-13s %5d %8d %6d%s %8s %9s  %s" %
               (p, s["n"], med, s["thin"],
                "!" if thin_rate > THIN_RATE_FAIL else " ",
                pct(s["desc"], s["n"]), pct(s["amen"], s["n"]),
                "OK" if ok else "*** FAIL ***"))
+
+    if no_desc:
+        print("\n  no description (an advert without one, or a page the extractor "
+              "misread):")
+        for p, pages in sorted(no_desc.items()):
+            for fetched, url in sorted(pages, reverse=True)[:5]:
+                print("    %-12s %s  %s" % (p, fetched, url))
+            if len(pages) > 5:
+                print("    %-12s ... and %d more" % (p, len(pages) - 5))
 
     # A portal is uncertified only if NOTHING of it has ever been cached. Today's
     # new listings not being cached yet is the normal state straight after a

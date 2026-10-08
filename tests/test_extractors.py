@@ -394,6 +394,41 @@ class TestOtmSearchTotal(unittest.TestCase):
         self.assertEqual(total, 1)
 
 
+class TestOtmSearchPayloadPath(unittest.TestCase):
+    """On 2026-10-08 OnTheMarket moved its Redux state from `props` to
+    `props.pageProps`, with everything inside unchanged. The extractor read
+    zero rows from a page that stated 3,075 results, and the run refused to
+    commit because the result looked like a block."""
+
+    def html(self, props):
+        return ('<script id="__NEXT_DATA__" type="application/json">%s</script>'
+                % json.dumps({"props": props}))
+
+    def results(self):
+        return {"results": {"list": [{"details-url": "/details/7/",
+                                      "address": "Broughton Road, London, SW6",
+                                      "price": "£2,900 pcm (£669 pw)",
+                                      "bedrooms": 2, "bathrooms": 1}],
+                            "totalResults": 3075}}
+
+    def test_the_state_under_page_props_is_read(self):
+        rows, total = portals.otm_search(
+            self.html({"pageProps": {"initialReduxState": self.results()},
+                       "__N_SSP": True}), None)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(total, 3075)
+        self.assertEqual(rows[0]["url"], "https://www.onthemarket.com/details/7/")
+
+    def test_the_old_location_still_reads(self):
+        rows, total = portals.otm_search(
+            self.html({"initialReduxState": self.results()}), None)
+        self.assertEqual((len(rows), total), (1, 3075))
+
+    def test_neither_location_is_an_unread_page(self):
+        self.assertEqual(portals.otm_search(
+            self.html({"pageProps": {"somethingElse": {}}}), None), ([], 0))
+
+
 class TestRightmoveSearchTotal(unittest.TestCase):
     """A stated zero and an unreadable page must not share a total: the first
     is a quiet window, the second may be a block. Both returned 0, and a
@@ -419,6 +454,43 @@ class TestRightmoveSearchTotal(unittest.TestCase):
     def test_an_unreadable_page_is_none(self):
         self.assertEqual(portals.rightmove_search("<html>challenge</html>", None), ([], None))
         self.assertIsNone(portals.rightmove_search(self.page(None), None)[1])
+
+
+class TestStatedCount(unittest.TestCase):
+    """Each portal's printed count, in the form measured live on 2026-10-08."""
+
+    RM = "https://www.rightmove.co.uk/property-to-rent/find.html?x=1"
+    ZP = "https://www.zoopla.co.uk/to-rent/property/london/?x=1"
+    OTM = "https://www.onthemarket.com/to-rent/property/london/?x=1"
+    OR = "https://www.openrent.co.uk/properties-to-rent/london?x=1"
+
+    def test_each_portal_states_its_count(self):
+        cases = [
+            (self.RM, "Save Search\nCreate Alert\n\n956 results\n", 956),
+            (self.ZP, "Most reduced\n\n1025 results\n\nProperty of the week", 1025),
+            (self.OTM, "Create alert\n3,075 results2+ bedroom properties", 3075),
+            (self.OR, "Your filtered search is displaying: 773 of 5556 properties found", 773),
+        ]
+        for url, text, n in cases:
+            with self.subTest(url=url):
+                self.assertEqual(portals.stated_count(url, text), n)
+
+    def test_zoopla_location_box_is_not_the_count(self):
+        """Every Zoopla page prints "0 results found" in its location box,
+        above the real count."""
+        text = "to select.\n0 results found\nRadius\nMost reduced\n\n1025 results\n"
+        self.assertEqual(portals.stated_count(self.ZP, text), 1025)
+
+    def test_a_page_with_nothing_states_nothing_positive(self):
+        self.assertEqual(portals.stated_count(
+            self.OR, "displaying: 0 of 5556 properties found"), 0)
+        self.assertFalse(portals.stated_count(self.OTM, "Create alert\n0 results2+ bedroom"))
+        self.assertIsNone(portals.stated_count(self.ZP, "to select.\n0 results found\n"))
+
+    def test_a_challenge_page_states_nothing(self):
+        self.assertIsNone(portals.stated_count(self.ZP, "Just a moment...\nVerify you are human"))
+        self.assertIsNone(portals.stated_count(self.RM, ""))
+        self.assertIsNone(portals.stated_count("https://example.com/", "12 results"))
 
 
 class TestEmptyFirstPage(unittest.TestCase):
@@ -447,6 +519,29 @@ class TestEmptyFirstPage(unittest.TestCase):
 
     def test_past_page_zero_is_the_end(self):
         self.assertEqual(self.status(self.RM, None, page_no=2), "ok")
+
+    def test_a_page_stating_listings_is_an_extractor_miss(self):
+        """2026-10-08: OnTheMarket's payload moved, the page said 3,075, and
+        the run called it a possible block. It is still a failure - nothing
+        was read - but it names the cause."""
+        otm = "https://www.onthemarket.com/to-rent/property/london/?recently-added=3-days"
+        status = self.fetch.empty_status(otm, 0, 0, portals.portal_for(otm),
+                                         "Create alert\n3,075 results2+ bedroom properties")
+        self.assertIn(self.fetch.MISSED, status)
+        self.assertIn("3,075", status)
+        self.assertTrue(status.startswith("EMPTY on page 0"))
+
+    def test_a_stated_count_outranks_a_quiet_zero(self):
+        """A payload saying 0 beside a page saying 956 is a payload misread."""
+        url = self.RM + "&maxDaysSinceAdded=3"
+        status = self.fetch.empty_status(url, 0, 0, portals.portal_for(url),
+                                         "Create Alert\n\n956 results\n")
+        self.assertIn(self.fetch.MISSED, status)
+
+    def test_a_page_stating_nothing_is_still_empty(self):
+        self.assertEqual(self.fetch.empty_status(
+            self.ZP, 0, 0, portals.portal_for(self.ZP),
+            "Press Enter key to select.\n0 results found\nRadius"), "EMPTY on page 0")
 
     def test_quiet_needs_a_sibling_that_found_something(self):
         """The window fails closed on a value the portal rejects, as a stated

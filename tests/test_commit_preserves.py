@@ -243,6 +243,37 @@ class TestAuditOnAFreshClone(unittest.TestCase):
              "fetched_at": "2026-09-20", "text": "tiny"}), encoding="utf-8")
         self.assertIs(quiet(audit.report, self.cfg, self.stage1), False)
 
+    def cache_pages(self, n, missing, host="https://www.rightmove.co.uk/properties/"):
+        for i in range(n):
+            text = ("Key features: x / y\n" if i < missing
+                    else "Description: ") + "a real advert " * 40
+            (self.cfg.cache_dir / ("%016x.json" % (1000 + i))).write_text(json.dumps(
+                {"url": "%s%d" % (host, 1000 + i), "fetched_at": "2026-10-07",
+                 "text": text}), encoding="utf-8")
+
+    def test_one_advert_without_a_description_does_not_hold_the_gate(self):
+        """2026-10-08: one page in 3,532, read the day after it was listed,
+        before the agent wrote a description, held the gate red."""
+        self.cache_pages(200, missing=1)
+        self.assertIs(quiet(audit.report, self.cfg, self.stage1), True)
+
+    def test_descriptions_going_missing_still_fails(self):
+        self.cache_pages(200, missing=10)
+        self.assertIs(quiet(audit.report, self.cfg, self.stage1), False)
+
+    def test_an_untracked_page_is_filed_under_its_portal(self):
+        """A listing rejected on its detail page is cached but never tracked;
+        its URL still names the portal."""
+        import contextlib, io
+        self.cache_pages(3, missing=0, host="https://www.onthemarket.com/details/")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            audit.report(self.cfg, self.stage1)
+        rows = [l.split()[0] for l in out.getvalue().splitlines()
+                if l.endswith("OK") or l.endswith("***")]
+        self.assertIn("OnTheMarket", rows)
+        self.assertNotIn("?", rows)
+
     def test_a_cache_file_without_a_url_is_skipped_not_crashed_on(self):
         (self.cfg.cache_dir / "bbbbbbbbbbbbbbbb.json").write_text(
             json.dumps({"fetched_at": "2026-09-20", "text": "x" * 900}),
