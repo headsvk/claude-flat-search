@@ -336,19 +336,23 @@ def run(cfg, out_path, review_path, stage1_path=None) -> int:
         print("re-judge          : %d  (page changed under a stored verdict)" % len(stale))
     print("NEEDS JUDGEMENT   : %d  -> %s" % (len(review), review_path))
     for r in review:
-        print("   ! %s  terms=%s%s" % (r["url"].rsplit("/", 1)[-1], r["terms"],
+        print("   ! %s  terms=%s%s" % (r["url"].rstrip("/").rsplit("/", 1)[-1], r["terms"],
                                        "  [re-judge]" if r.get("rejudge") else ""))
     if decoy_hits:
         print("\nnear-misses (NOT A/C, listed so they are visible):")
         for url, d in decoy_hits[:10]:
-            print("   ~ %s  %s" % (url.rsplit("/", 1)[-1], d))
+            print("   ~ %s  %s" % (url.rstrip("/").rsplit("/", 1)[-1], d))
     if thin:
         print("\nWARNING - suspiciously short cached text (%d):" % len(thin))
         for url, n in thin[:10]:
-            print("   ? %s  %d chars" % (url.rsplit("/", 1)[-1], n))
-    print("\nIf NEEDS JUDGEMENT is 0, verdicts.json is complete: run core.py commit.")
-    print("Otherwise judge those entries for scope (in_unit vs communal_only)")
-    print("with a verbatim quote, append them to verdicts.json, then commit.")
+            print("   ? %s  %d chars" % (url.rstrip("/").rsplit("/", 1)[-1], n))
+    # This hint is what an unattended run reads at the decision point, so it
+    # must match docs/runbook.md step 4. It said "append them to verdicts.json,
+    # then commit" - the one file the runbook says never to write by hand.
+    print("\nIf NEEDS JUDGEMENT is 0, verdicts.json is complete: `flat-search commit`.")
+    print("Otherwise have a model judge those entries for scope (in_unit vs")
+    print("communal_only) with a verbatim quote, write them to")
+    print("data/runs/verdicts_haiku_new.json, then `flat-search finish`.")
     return len(review)
 
 
