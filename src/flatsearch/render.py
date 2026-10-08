@@ -185,6 +185,16 @@ def mergeable(a: dict, b: dict) -> bool:
     return True
 
 
+def aircon_phrase(groups: list) -> str:
+    """The "N with A/C in unit" count, in flats. Counting ads made one Camden
+    building's two flats, cross-posted to three portals each, read as six of
+    the nine "with A/C" on 2026-10-08 - five flats in all. The ad count rides
+    along when it differs, the way the section headings carry theirs."""
+    flats = sum(1 for g in groups if any(core.aircon_in_unit(l) for l in g))
+    ads = sum(1 for g in groups for l in g if core.aircon_in_unit(l))
+    return "%d with A/C in unit%s" % (flats, " (%d ads)" % ads if ads != flats else "")
+
+
 def group_dupes(rows: list) -> list:
     """Rows in the order given, each group being one flat as far as anything
     stated can tell. Order is preserved, so the representative is whatever
@@ -376,9 +386,9 @@ def render_daily(state: dict, decisions: dict, day: str) -> tuple:
     live = order([l for l in todays if is_live(l)])
     dead = [l for l in todays if not is_live(l)]
 
-    ac = [l for l in live if core.aircon_in_unit(l)]
     buildings = building_counts(listings)
-    distinct = len(group_dupes(live))
+    groups = group_dupes(live)
+    distinct = len(groups)
     out = ["# New listings — %s" % day, ""]
     if not live and not dead:
         out += ["Nothing new today.", ""]
@@ -387,10 +397,10 @@ def render_daily(state: dict, decisions: dict, day: str) -> tuple:
                     "once it is read." % waiting, ""]
         return '\n'.join(out), [], held, 0
 
-    out += ["**%d new**%s · %d with A/C in unit · %d ruled out before you saw them"
+    out += ["**%d new**%s · %s · %d ruled out before you saw them"
             % (len(live),
                " (%d distinct flats)" % distinct if distinct != len(live) else "",
-               len(ac), len(dead)), "",
+               aircon_phrase(groups), len(dead)), "",
             "Sizes marked `*` were read off a floorplan by OCR, not stated by the agent.",
             "Record any call in `decisions.md`. Earlier days are in this folder.", ""]
     if waiting:
@@ -447,13 +457,13 @@ def render(state: dict, decisions: dict, limit_low: int = 60) -> str:
 
     today = dt.date.today().isoformat()
     buildings = building_counts(listings)
-    distinct = len(group_dupes(live))
-    ac = sum(1 for l in live if core.aircon_in_unit(l))
+    groups = group_dupes(live)
+    distinct = len(groups)
     out = ["# Flat shortlist", "",
-           "%s · **%d live**%s · %d with A/C in unit · %d ruled out"
+           "%s · **%d live**%s · %s · %d ruled out"
            % (today, len(live),
               " (%d distinct flats)" % distinct if distinct != len(live) else "",
-              ac, len(dead)), "",
+              aircon_phrase(groups), len(dead)), "",
            "Sizes marked `*` were read off a floorplan by OCR, not stated by the agent.",
            "To record a call, add a line to `decisions.md` — this file is regenerated every run.",
            ""]

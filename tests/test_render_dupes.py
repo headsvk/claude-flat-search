@@ -113,6 +113,29 @@ class TestDuplicateAds(unittest.TestCase):
                          listing("https://zoopla/1", platform="Zoopla")])
         self.assertIn("**2 new** (1 distinct flats)", text)
 
+    def test_the_ac_count_is_in_flats_too(self):
+        """2026-10-08 said "9 with A/C in unit" of five flats: two Camden
+        flats in one building, each cross-posted to three portals."""
+        ac = dict(aircon="yes", aircon_scope="in_unit")
+        rows = ([listing("https://p%d/a" % i, platform="P%d" % i, **ac) for i in range(3)]
+                + [listing("https://p%d/b" % i, platform="P%d" % i, price_pcm=4600, **ac)
+                   for i in range(3)]
+                + [listing("https://other/c", price_pcm=3900, area="Elsewhere, N1",
+                           postcode="Elsewhere, N1", **ac)])
+        text, _ = daily(rows)
+        self.assertIn("3 with A/C in unit (7 ads)", text)
+
+    def test_the_ad_count_is_left_out_when_it_says_nothing_new(self):
+        text, _ = daily([listing("https://a/1", aircon="yes", aircon_scope="in_unit"),
+                         listing("https://a/2", price_pcm=4900)])
+        self.assertIn("· 1 with A/C in unit ·", text)
+
+    def test_the_shortlist_counts_flats_as_well(self):
+        ac = dict(aircon="yes", aircon_scope="in_unit")
+        text = render.render({"listings": [listing("https://r/1", **ac),
+                                           listing("https://z/1", platform="Zoopla", **ac)]}, {})
+        self.assertIn("1 with A/C in unit (2 ads)", text)
+
 
 class TestBuildingClusters(unittest.TestCase):
 
