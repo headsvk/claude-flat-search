@@ -690,6 +690,12 @@ def gate_unjudged(cfg, verdicts_path) -> None:
     raise Abort(UNJUDGED % (len(missing), listed, review_path))
 
 
+# Each portal's clean search result from the morning, so a re-run after one
+# portal failed searches only that one. Written by fetch.run_search, deleted
+# by commit.
+SEARCH_REUSE = "search_portals.json"
+
+
 def commit(cfg, stage1_path, verdicts_path=None, update=False):
     """Write stage-1 listings into state.json.
 
@@ -845,6 +851,9 @@ def commit(cfg, stage1_path, verdicts_path=None, update=False):
             added += 1
 
     save_state(cfg, state)
+    # Committed portals must not stand in for a later search: the window and
+    # the tracked set have both moved, so a reuse would bring back nothing new.
+    (cfg.runs_dir / SEARCH_REUSE).unlink(missing_ok=True)
     print("state: " + str(cfg.state_path))
     print("added %d, updated %d, tracked total %d" % (added, updated, len(state["listings"])))
     if parked:

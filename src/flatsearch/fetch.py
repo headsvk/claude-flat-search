@@ -403,12 +403,41 @@ async def collect(url: str, seen: set, known: set | None = None,
     return found, "ok"
 
 
-async def run_search(cfg, out_path, incremental: bool = False) -> bool:
+def reuse_key(host_urls, incremental: bool) -> dict:
+    """What a saved portal result must match to stand in for a fresh search.
+
+    The date, because a result is only worth reusing for the morning it was
+    taken. The exact scoped URLs, because the window is part of them and a
+    changed config or a changed gap must search again. Commit deletes the
+    file outright, since it moves both the window and what `known` holds.
+    """
+    return {"date": core.today(), "urls": list(host_urls),
+            "incremental": bool(incremental)}
+
+
+def load_reusable(cfg) -> dict:
+    path = cfg.runs_dir / core.SEARCH_REUSE
+    if not path.exists():
+        return {}
+    try:
+        return core.read_json(path).get("portals", {})
+    except (ValueError, OSError, AttributeError):
+        return {}
+
+
+async def run_search(cfg, out_path, incremental: bool = False,
+                     fresh: bool = False) -> bool:
     """-> True when every portal came back clean.
 
     Returns a bool rather than exiting, because the CALLER has to decide what a
     failed search means - and the only safe answer is "do not commit". An empty
     search and a blocked one are indistinguishable from here.
+
+    Each portal that comes back clean is saved as soon as it finishes, and a
+    re-run the same morning reuses it instead of paging it again. The one re-run
+    a failure allows is almost always about one portal - 2026-11-05: Zoopla was
+    challenged, and the re-run paged 655 listings on the other three again to
+    get them back unchanged. `fresh` searches every portal regardless.
     """
     await preflight(cfg)
     out_path = pathlib.Path(out_path)
@@ -427,6 +456,24 @@ async def run_search(cfg, out_path, incremental: bool = False) -> bool:
     by_host: dict = {}
     for url in urls:
         by_host.setdefault(url.split("/")[2], []).append(url)
+
+    # Only a clean result is ever saved, so only a clean one can be reused: a
+    # portal that failed is always searched again.
+    saved = {} if fresh else load_reusable(cfg)
+    saved = {h: e for h, e in saved.items()
+             if h in by_host and e.get("key") == reuse_key(by_host[h], incremental)}
+    reuse_path = cfg.runs_dir / core.SEARCH_REUSE
+
+    def remember(host, rows, problems, log):
+        if problems:
+            saved.pop(host, None)
+        else:
+            saved[host] = {"key": reuse_key(by_host[host], incremental),
+                           "at": dt.datetime.now().strftime("%H:%M"),
+                           "rows": rows, "log": log}
+        # Written per portal, not at the end, so a run killed while the slowest
+        # portal is still paging keeps the ones that had finished.
+        core.write_json(reuse_path, {"portals": saved})
 
     async def run_host(host, host_urls):
         """One browser per portal, its URLs in order - unchanged behaviour."""
@@ -447,10 +494,23 @@ async def run_search(cfg, out_path, incremental: bool = False) -> bool:
             await asyncio.sleep(random.uniform(3, 6))
         problems += quiet_problems(host, quiet, len(rows_all))
         print("  done %-20s %d listings" % (host, len(rows_all)), flush=True)
+        remember(host, rows_all, problems, log)
         return rows_all, problems, log
 
-    print("searching %d portals concurrently" % len(by_host), flush=True)
-    results = await asyncio.gather(*(run_host(h, u) for h, u in by_host.items()))
+    results = []
+    for host, entry in saved.items():
+        print("  reused %-18s %d listings, searched clean at %s today"
+              % (host, len(entry["rows"]), entry["at"]), flush=True)
+        results.append((entry["rows"], [],
+                        ["  (reused from %s)" % entry["at"]] + entry["log"]))
+    todo = {h: u for h, u in by_host.items() if h not in saved}
+    if todo:
+        print("searching %d portal(s) concurrently: %s"
+              % (len(todo), ", ".join(todo)), flush=True)
+        results += await asyncio.gather(*(run_host(h, u) for h, u in todo.items()))
+    else:
+        print("every portal reused - nothing searched (--fresh searches them again)",
+              flush=True)
 
     listings, problems, merged = [], [], set()
     for rows, host_problems, log in results:

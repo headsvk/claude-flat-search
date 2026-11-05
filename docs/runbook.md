@@ -105,8 +105,13 @@ empty page. If it exits non-zero:
     this morning would have its listings marked seen without ever being shown, and
     they would never appear in a daily file again.
   - You may still commit if the failure is confined to one portal AND re-running
-    `flat-search search` comes back clean. `search` has no single-portal option;
-    `--host` exists on `details` only. Otherwise stop after reporting.
+    `flat-search search` comes back clean. Otherwise stop after reporting. The
+    re-run searches only the portals that failed: each one that came back clean
+    is reused from earlier that morning, and the log says so (`reused
+    rightmove.co.uk  411 listings, searched clean at 07:12 today`). Those
+    listings still go into the stage file, so the commit covers all four.
+    Do not pass `--fresh`; it searches every portal again, which is the half
+    hour this avoids.
 
 A windowed Rightmove search that finds nothing new is NOT a problem: the log line
 reads `stated 0 in window`. That is accepted only because Rightmove states its

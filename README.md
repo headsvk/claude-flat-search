@@ -155,6 +155,12 @@ as seen, so a portal blocked this morning would have its listings marked seen wi
 ever being shown, and they would never appear in a daily file again. That rule used to
 live in a runbook; it lives in the code now.
 
+A failure is usually one portal, so a re-run searches only the portals that failed.
+Each portal that comes back clean is saved as soon as it finishes
+(`data/runs/search_portals.json`) and reused for the rest of that day, until a
+commit discards it. A saved portal is reused only if its search URLs and window are
+unchanged. `--fresh` searches every portal again.
+
 When listings mention cooling, `run` stops and asks a model to judge them — in-unit
 versus the residents' gym is reading comprehension, not pattern matching. Write the
 verdicts where it tells you, then:

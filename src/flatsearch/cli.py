@@ -45,15 +45,17 @@ def _load(args) -> config_mod.Config:
 def stage_search(cfg, args) -> pathlib.Path:
     out = cfg.runs_dir / "stage1.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    ok = asyncio.run(fetch_mod.run_search(cfg, out, incremental=args.incremental))
+    ok = asyncio.run(fetch_mod.run_search(cfg, out, incremental=args.incremental,
+                                          fresh=args.fresh))
     if not ok:
         raise Abort(
             "SEARCH FAILED - not committing.\n"
             "A challenged search and a quiet morning look identical, so this run\n"
             "stops here rather than marking unseen listings as seen. Listings\n"
             "committed now would never appear in a daily file again.\n"
-            "Re-run `flat-search search` (it has no single-portal option;\n"
-            "--host is on `details` only), or try later.")
+            "Re-run `flat-search search`: the portals that came back clean\n"
+            "are reused from this run, and only the failed ones are searched\n"
+            "again. Or try later.")
     return out
 
 
@@ -263,6 +265,10 @@ def cmd_check(args) -> int:
     return 0
 
 
+FRESH_HELP = ("search every portal again, instead of reusing the ones that "
+              "already came back clean today")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="flat-search",
@@ -274,7 +280,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add(name, fn, help_):
         s = sub.add_parser(name, help=help_)
-        s.set_defaults(fn=fn, incremental=False, refresh=False, host=None)
+        s.set_defaults(fn=fn, incremental=False, refresh=False, host=None,
+                       fresh=False)
         return s
 
     r = add("run", cmd_run, "the whole pipeline, in the only safe order")
@@ -284,12 +291,14 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--refresh", action="store_true",
                    help="re-queue already-tracked listings from today's search, "
                         "to re-read their pages deliberately")
+    r.add_argument("--fresh", action="store_true", help=FRESH_HELP)
 
     f = add("finish", cmd_finish, "commit and render after a model judged the flagged listings")
     f.add_argument("--refresh", action="store_true", help="pairs with run --refresh")
 
     s = add("search", cmd_search, "stage 1 only: page the portal search results")
     s.add_argument("--incremental", action="store_true")
+    s.add_argument("--fresh", action="store_true", help=FRESH_HELP)
 
     add("audit", cmd_audit, "per-portal extraction health, against what is cached")
 
