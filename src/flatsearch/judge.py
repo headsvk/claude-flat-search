@@ -100,6 +100,12 @@ REFURB_POS = re.compile(
     r"|(?:has|have|been)\s+(?:recently\s+|fully\s+)?(?:refurbish\w*|renovat\w*|modernis\w*)"
     r"|\brefurbish(?:ed|ment)\b|\brenovated\b|\bbrand[- ]new\b", re.I)
 
+# "New Build" counts as a feature only when the portal lists it as one:
+# Zoopla's key-features line reads "... / Balcony / New Build / Porter". Bare
+# substring matching would fire on the nav bar's "New build homes" link, which
+# is on every Zoopla page, so the term must be a whole delimited item.
+NEW_BUILD = re.compile(r"(?:^|/|\n|,)[ \t]*new[- ]build[ \t]*(?:/|,|\n|$)", re.I | re.M)
+
 
 def amenities(text: str) -> dict:
     low = text.lower()
@@ -134,6 +140,8 @@ def amenities(text: str) -> dict:
     # Negative wins: a listing that says both is describing work still to do.
     if REFURB_NEG.search(low):
         out["condition"] = "needs_work"
+    elif NEW_BUILD.search(low):
+        out["condition"] = "new_build"
     elif REFURB_POS.search(low):
         out["condition"] = "refurbished"
 

@@ -328,6 +328,11 @@ def apply_amenities(tier: int, listing: dict, cfg: dict) -> tuple[int, list[str]
     if condition == "refurbished":
         tier = max(0, tier - 1)
         notes.append("refurbished/renovated")
+    elif condition == "new_build":
+        # One tier, same as refurbished and not stacked with it (one condition
+        # per listing). Decided 2026-11-07.
+        tier = max(0, tier - 1)
+        notes.append("new build")
     elif condition == "needs_work":
         tier = min(2, tier + 1)
         notes.append("needs refurbishment")

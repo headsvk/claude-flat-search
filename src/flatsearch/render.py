@@ -93,6 +93,8 @@ def flags(listing: dict) -> str:
     cond = str(listing.get("condition") or "")
     if "refurb" in cond.lower():
         out.append(cond)
+    elif cond == "new_build":
+        out.append("new build")
     return ", ".join(out) or "–"
 
 

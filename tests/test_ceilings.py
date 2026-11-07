@@ -109,3 +109,27 @@ class TestConfigValidation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNewBuild(unittest.TestCase):
+    """New Build is read only as a listed feature, and promotes one tier."""
+
+    def test_listed_feature_is_read(self):
+        from flatsearch import judge
+        self.assertEqual(judge.amenities("Lift / Balcony / New Build / Porter")["condition"],
+                         "new_build")
+
+    def test_nav_link_is_not_a_feature(self):
+        from flatsearch import judge
+        self.assertNotIn("condition", judge.amenities("Buy Houses New build homes Commercial"))
+
+    def test_needs_work_wins(self):
+        from flatsearch import judge
+        self.assertEqual(judge.amenities("in need of refurbishment / New Build / x")["condition"],
+                         "needs_work")
+
+    def test_promotes_one_tier(self):
+        cfg = make_config()
+        tier, notes = core.apply_amenities(2, {"condition": "new_build"}, cfg)
+        self.assertEqual(tier, 1)
+        self.assertIn("new build", notes)
