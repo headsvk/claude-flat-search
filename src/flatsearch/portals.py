@@ -360,6 +360,14 @@ def fact_labels(html: str, block_re: str, item_re: str) -> list:
 FURNISHING = {"furnished": "Furnished", "unfurnished": "Unfurnished",
               "part furnished": "Part furnished", "partly furnished": "Part furnished"}
 
+# The landlord's-choice value, spelled the way core and render recognise it
+# ("or unfurnished" in the raw string). Zoopla's tag reads exactly this. It was
+# missing from FURNISHING, so the tag was skipped and the text fallback took
+# the first bare "Furnished" on the page out of "furnished or unfurnished":
+# zoopla 74712066 on 2026-11-08, a flexible flat filed as furnished.
+FLEXIBLE = "Furnished or unfurnished"
+FLEXIBLE_RE = r"\b(?:furnished\s*(?:or|/)\s*unfurnished|unfurnished\s*(?:or|/)\s*furnished)\b"
+
 
 def furnishing_from(labels) -> "str | None":
     """Furnishing as the PORTAL states it, not as the advert mentions it.
@@ -369,10 +377,23 @@ def furnishing_from(labels) -> "str | None":
     and the prose disagree. The tag is the portal's own summary field.
     """
     for label in labels:
+        # A search, not a full match: OnTheMarket's item reads "Available as
+        # furnished or unfurnished" (nine listings on 2026-11-08).
+        if re.search(FLEXIBLE_RE, label, re.I):
+            return FLEXIBLE
         got = FURNISHING.get(label.strip().lower())
         if got:
             return got
     return None
+
+
+def furnishing_in_text(text: str) -> "str | None":
+    """The text fallback. The either-way phrase is checked first: matched word
+    by word, "furnished or unfurnished" reads as whichever word comes first."""
+    if re.search(FLEXIBLE_RE, text or "", re.I):
+        return FLEXIBLE
+    m = re.search(r"\b(Part furnished|Unfurnished|Furnished)\b", text or "", re.I)
+    return m.group(1).capitalize() if m else None
 
 
 def zoopla_detail(html: str, text: str = ""):
@@ -388,10 +409,7 @@ def zoopla_detail(html: str, text: str = ""):
     if desc:
         parts.append("Description: " + desc[:6000])
     tags = fact_labels(html, ZOOPLA_TAGS_RE, ZOOPLA_TAG_LABEL_RE)
-    furnished = furnishing_from(tags)
-    if not furnished:
-        m = re.search(r"(Furnished|Unfurnished|Part furnished)", text, re.I)
-        furnished = m.group(1).capitalize() if m else None
+    furnished = furnishing_from(tags) or furnishing_in_text(text)
     if furnished:
         info["furnished"] = furnished
     size = size_from_json(html, ZOOPLA_SIZE_RE, ZOOPLA_SIZE_RE2)
@@ -469,10 +487,7 @@ def otm_detail(html: str, text: str = ""):
         text, ["Letting details"], ["Features and description"], minlen=4)
     if lett:
         parts.append("Letting details: " + lett)
-    furnished = furnishing_from(items)
-    if not furnished:
-        m = re.search(r"\b(Furnished|Unfurnished|Part furnished)\b", lett or "", re.I)
-        furnished = m.group(1).capitalize() if m else None
+    furnished = furnishing_from(items) or furnishing_in_text(lett)
     if furnished:
         info["furnished"] = furnished
     # OnTheMarket publishes no size on its search cards - measured 0% coverage -
@@ -580,7 +595,9 @@ def openrent_detail(html: str, text: str = ""):
     avail = availability(text)
     if avail:
         info["available_from"] = avail
-    if re.search(r"offered unfurnished|unfurnished", text, re.I):
+    if re.search(FLEXIBLE_RE, text, re.I):
+        info["furnished"] = FLEXIBLE
+    elif re.search(r"offered unfurnished|unfurnished", text, re.I):
         info["furnished"] = "Unfurnished"
     elif re.search(r"\bfurnished\b", text, re.I):
         info["furnished"] = "Furnished"

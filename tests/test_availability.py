@@ -18,7 +18,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from flatsearch import portals  # noqa: E402
+from flatsearch import core, portals, render  # noqa: E402
 
 TODAY = dt.date(2026, 9, 21)
 
@@ -157,6 +157,39 @@ class TestTheFactContainersAreReadFirst(unittest.TestCase):
         _, info = portals.zoopla_detail(
             self.ZOOPLA, "The Property is offered part unfurnished, with a kitchen.")
         self.assertEqual(info.get("furnished"), "Unfurnished")
+
+    def test_zoopla_either_way_tag_is_not_read_as_furnished(self):
+        """zoopla 74712066, 2026-11-08: the tag said "Furnished or unfurnished",
+        the tag table did not know it, and the text fallback filed the flat as
+        Furnished off the first word of the same phrase in the advert."""
+        html = (r'{\"tagsV2\":[{\"label\":\"Available immediately\"},'
+                r'{\"label\":\"Furnished or unfurnished\"}]}')
+        _, info = portals.zoopla_detail(
+            html, "Furnished or unfurnished - Property comes furnished or "
+                  "unfurnished (tenant can decide)")
+        self.assertEqual(info.get("furnished"), "Furnished or unfurnished")
+        self.assertTrue(core.is_flexible_furnishing(info))
+        self.assertEqual(render.furnishing_label(info), "either")
+
+    def test_onthemarket_either_way_item_is_not_read_as_furnished(self):
+        html = ('{"lettingDetails":{"items":["Available immediately",'
+                '"Available as furnished or unfurnished","Long term let"]}}')
+        _, info = portals.otm_detail(html, "")
+        self.assertEqual(info.get("furnished"), "Furnished or unfurnished")
+
+    def test_the_text_fallback_reads_the_either_way_phrase_whole(self):
+        for page, want in (("Property comes furnished or unfurnished", "Furnished or unfurnished"),
+                           ("Offered unfurnished or furnished", "Furnished or unfurnished"),
+                           ("Furnished/Unfurnished", "Furnished or unfurnished"),
+                           ("Offered part furnished", "Part furnished"),
+                           ("Unfurnished", "Unfurnished"),
+                           ("Fully furnished", "Furnished"),
+                           ("No mention at all", None)):
+            _, info = portals.zoopla_detail("<html></html>", page)
+            self.assertEqual(info.get("furnished"), want, page)
+        _, info = portals.openrent_detail(
+            "", "Property comes furnished or unfurnished (tenant can decide)")
+        self.assertEqual(info.get("furnished"), "Furnished or unfurnished")
 
     def test_onthemarket_furnishing_comes_off_the_items(self):
         _, info = portals.otm_detail(self.OTM, "")
